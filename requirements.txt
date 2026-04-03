@@ -1,0 +1,17 @@
+# SemPatch Replain - Ghidra + DAG + 固件漏洞分析
+# Python 3.8+
+# 必需: networkx（CFG/ACFG）
+# 可选: ssdeep, py-tlsh（fuzzy_hash）, faiss-cpu（diff_faiss 策略需要）, scipy（bipartite）
+# 可选: torch（MultiModalFusionModel 嵌入）
+# 可选: tensorboard（训练日志，默认启用）, wandb（--wandb 实验追踪）
+# PyYAML：train_multimodal.py --config 配置文件
+pytest>=7.0
+PyYAML>=6.0
+faiss-cpu>=1.7.0
+networkx>=2.0
+ssdeep>=3.4
+py-tlsh>=4.7
+scipy>=1.0
+torch>=2.0
+tensorboard>=2.0
+tqdm>=4.0

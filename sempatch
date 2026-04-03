@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""SemPatch CLI 入口，委托给 sempatch.py（含子命令白名单、双参 CVE match、legacy extract）。"""
+import os
+import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+sys.path.insert(0, PROJECT_ROOT)
+
+from sempatch_argv import rewrite_sempatch_argv  # noqa: E402
+
+argv = rewrite_sempatch_argv(list(sys.argv[1:]))
+sys.argv = [sys.argv[0]] + argv
+
+if __name__ == "__main__":
+    import runpy
+
+    runpy.run_path(os.path.join(PROJECT_ROOT, "sempatch.py"), run_name="__main__")

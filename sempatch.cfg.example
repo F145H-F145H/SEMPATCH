@@ -1,0 +1,59 @@
+# SemPatch Replain - Ghidra 下载 + 函数提取
+# 复制为 sempatch.cfg 并修改
+
+[ghidra]
+# Ghidra 安装目录（相对项目根或绝对路径）
+# setup.sh 安装后默认为 third_party/ghidra_12.0_PUBLIC
+ghidra_home = third_party/ghidra_12.0_PUBLIC
+
+[paths]
+# 数据集与漏洞库根目录；CLI「match」默认 --two-stage-dir = <data_dir>/<two_stage_rel>
+data_dir = data
+# 相对 data_dir：两阶段约定文件名目录（library_features.json 等）
+two_stage_rel = two_stage
+output_dir = output
+# 相对 output_dir：未指定 --output-dir 时 match 默认输出目录（原 prototype_pipeline_run 已改为可配置）
+match_run_subdir = match_run
+log_dir = output/logs
+unpack_output_dir = output/unpacked
+# lsir_raw 等 binary_cache；留空可禁用（见 src/config.py）
+binary_cache_dir = output/binary_cache
+
+[unpack]
+binwalk_cmd = binwalk
+
+[parallel]
+# 批量提取时的并发数，0 表示串行
+parallel_workers = 4
+
+[dag]
+# DAG 执行器：Ghidra 节点最大并发槽位
+ghidra_thread_slots = 2
+# 线程池 worker 数
+max_workers = 4
+# 流水线策略：traditional_fuzzy | traditional_cfg | graph_embed | semantic_embed | fusion
+pipeline_strategy = semantic_embed
+
+[ir]
+# IR 构建器默认选项
+# default_opts =
+
+[feature]
+# 特征提取：图特征 / 序列特征
+graph_enabled = true
+seq_enabled = true
+
+[matcher]
+# 向量检索索引类型（flat / ivf 等）
+faiss_index_type = flat
+
+# ── 预设配置 Profile ──────────────────────────────────────────
+# 通过 --profile <name> 使用，CLI 参数可覆盖 profile 默认值。
+#
+# quick:    快速探索（coarse_k=50, top_k=5, top_k 过滤, max_queries=10）
+# standard: 均衡模式（coarse_k=100, top_k=10, unique 过滤, min_similarity=0.95）
+# full:     全量扫描（coarse_k=500, top_k=50, all_above 过滤, min_similarity=0.9）
+#
+# 示例:
+#   python sempatch.py match --query-binary <elf> --two-stage-dir <dir> --profile standard
+#   python sempatch.py match --query-binary <elf> --two-stage-dir <dir> --profile full --top-k 20

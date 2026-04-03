@@ -1,0 +1,12 @@
+[
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_01.elf", "function_name": "vuln_fake_01", "cve": ["FAKE-CVE-0001"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_02.elf", "function_name": "vuln_fake_02", "cve": ["FAKE-CVE-0002"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_03.elf", "function_name": "vuln_fake_03", "cve": ["FAKE-CVE-0003"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_04.elf", "function_name": "vuln_fake_04", "cve": ["FAKE-CVE-0004"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_05.elf", "function_name": "vuln_fake_05", "cve": ["FAKE-CVE-0005"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_06.elf", "function_name": "vuln_fake_06", "cve": ["FAKE-CVE-0006"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_07.elf", "function_name": "vuln_fake_07", "cve": ["FAKE-CVE-0007"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_08.elf", "function_name": "vuln_fake_08", "cve": ["FAKE-CVE-0008"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_09.elf", "function_name": "vuln_fake_09", "cve": ["FAKE-CVE-0009"]},
+  {"binary": "examples/fake_cve_demo/build/vuln_fake_10.elf", "function_name": "vuln_fake_10", "cve": ["FAKE-CVE-0010"]}
+]

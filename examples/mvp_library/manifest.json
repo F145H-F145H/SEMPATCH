@@ -1,0 +1,5 @@
+[
+  {"binary": "examples/mvp_library/build/mvp_vuln_01.elf", "function_name": "vuln_buf_overflow", "cve": ["CVE-MVP-2024-0001"]},
+  {"binary": "examples/mvp_library/build/mvp_vuln_02.elf", "function_name": "vuln_loop_write", "cve": ["CVE-MVP-2024-0002"]},
+  {"binary": "examples/mvp_library/build/mvp_vuln_03.elf", "function_name": "vuln_sprintf_ovf", "cve": ["CVE-MVP-2024-0003"]}
+]

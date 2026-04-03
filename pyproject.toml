@@ -1,0 +1,27 @@
+[tool.black]
+line-length = 100
+target-version = ["py38"]
+include = '\.pyi?$'
+exclude = '/(\.git|\.venv|third_party|output)/'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip = [".venv", "third_party", "output"]
+known_first_party = ["utils", "frontend", "dag", "features", "matcher", "config", "cli"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+exclude = [".git", ".venv", "third_party", "output"]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+pythonpath = ["src"]
+markers = [
+    "integration: marks tests as integration tests (e.g. require Ghidra)",
+    "ghidra: marks tests that require a real Ghidra installation and headless run",
+    "fake_cve: FAKE-CVE-* JSON library + match pipeline (tests/test_fake_cve_match.py)",
+]

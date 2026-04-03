@@ -1,0 +1,1 @@
+{"smoke_query|0x1": {"graph": {"num_nodes": 1, "edge_index": [[], []], "node_features": [[]]}, "sequence": {"pcode_tokens": ["COPY", "INT_SUB", "INT_ADD"], "jump_mask": [0, 0, 0], "seq_len": 3}}}

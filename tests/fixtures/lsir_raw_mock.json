@@ -1,0 +1,44 @@
+{
+  "functions": [
+    {
+      "name": "mock_func",
+      "entry": "00101000",
+      "basic_blocks": [
+        {
+          "start": "00101000",
+          "end": "00101010",
+          "instructions": [
+            {
+              "address": "00101000",
+              "mnemonic": "COPY",
+              "operands": "",
+              "pcode": [
+                {
+                  "opcode": "COPY",
+                  "output": "(register, 0x0, 8)",
+                  "inputs": ["(const, 0x0, 8)"]
+                }
+              ],
+              "source_line": null,
+              "source_file": null
+            },
+            {
+              "address": "00101008",
+              "mnemonic": "RETURN",
+              "operands": "",
+              "pcode": [
+                {
+                  "opcode": "RETURN",
+                  "output": null,
+                  "inputs": []
+                }
+              ],
+              "source_line": null,
+              "source_file": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
