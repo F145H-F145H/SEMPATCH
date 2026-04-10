@@ -7,7 +7,7 @@ import sys
 from typing import Any, Dict, Optional
 
 try:
-    from utils.config import LOG_LEVEL
+    from config import LOG_LEVEL
 except Exception:
     LOG_LEVEL = "INFO"
 

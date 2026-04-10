@@ -3,7 +3,7 @@
 import os
 from typing import Any, Dict, List, Optional
 
-from utils.config import DAG_GHIDRA_THREAD_SLOTS
+from config import DAG_GHIDRA_THREAD_SLOTS
 
 from ..model import JobDAG
 

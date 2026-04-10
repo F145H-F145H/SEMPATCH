@@ -10,7 +10,7 @@ import json
 import os
 from typing import List, Optional
 
-from utils.config import LOG_DIR, PROJECT_ROOT
+from config import LOG_DIR, PROJECT_ROOT
 from utils.logger import get_logger
 
 from ._ghidra_helpers import (
@@ -38,7 +38,7 @@ logger = get_logger(
     format_type="colored",
 )
 
-_DEFAULT_SCRIPT_DIR = os.path.join(PROJECT_ROOT, "src", "frontend", "ghidra_scripts")
+_DEFAULT_SCRIPT_DIR = os.path.join(PROJECT_ROOT, "src", "utils", "ghidra_scripts")
 
 
 def run_ghidra_analysis(

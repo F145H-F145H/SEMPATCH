@@ -88,7 +88,7 @@ def _root() -> str:
 def _ghidra_available() -> bool:
     try:
         sys.path.insert(0, os.path.join(_root(), "src"))
-        from utils.config import ANALYZE_HEADLESS, GHIDRA_HOME
+        from config import ANALYZE_HEADLESS, GHIDRA_HOME
 
         return (
             bool(GHIDRA_HOME)

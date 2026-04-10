@@ -18,7 +18,7 @@ from dag.model import JobDAG
 def _ghidra_available() -> bool:
     """检查 Ghidra 环境是否可用。"""
     try:
-        from utils.config import ANALYZE_HEADLESS, GHIDRA_HOME
+        from config import ANALYZE_HEADLESS, GHIDRA_HOME
 
         return (
             bool(GHIDRA_HOME)

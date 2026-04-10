@@ -154,9 +154,9 @@ class Trainer:
                     if since_log >= log_batches_every:
                         wavg = window_loss / window_count if window_count else 0.0
                         total_s = f"/{n_batches}" if n_batches is not None else ""
-                        print(
-                            f"  [{phase}] batch {batch_idx + 1}{total_s}  window_avg_loss={wavg:.4f}",
-                            flush=True,
+                        _log.info(
+                            "  [%s] batch %s%s  window_avg_loss=%.4f",
+                            phase, batch_idx + 1, total_s, wavg,
                         )
                         since_log = 0
                         window_loss = 0.0
@@ -207,20 +207,19 @@ class Trainer:
             try:
                 n_tr = len(self.train_loader)
                 n_va = len(self.val_loader)
-                print(
-                    f"[Trainer] 每 epoch: 训练 {n_tr} batch | 验证 {n_va} batch",
-                    flush=True,
+                _log.info(
+                    "[Trainer] 每 epoch: 训练 %s batch | 验证 %s batch",
+                    n_tr, n_va,
                 )
             except TypeError:
-                print("[Trainer] 进度条已启用（DataLoader 长度未知，无 batch 总数）", flush=True)
+                _log.info("[Trainer] 进度条已启用（DataLoader 长度未知，无 batch 总数）")
             try:
                 import tqdm  # noqa: F401
             except ImportError:
-                print(
-                    "[Trainer] 未安装 tqdm，将每 "
-                    f"{run_kw['log_batches_every']} 个 batch 打印一行进度；"
+                _log.warning(
+                    "[Trainer] 未安装 tqdm，将每 %d 个 batch 打印一行进度；"
                     "可 pip install tqdm 获得进度条。",
-                    flush=True,
+                    run_kw["log_batches_every"],
                 )
 
         def _clear_dataset_runtime_cache(loader: Any) -> None:
@@ -242,10 +241,9 @@ class Trainer:
                 on_epoch_begin(epoch)
             train_loss = self.train_epoch(phase="train", **run_kw)
             val_loss, val_acc = self.validate(phase="val", **run_kw)
-            print(
-                f"Epoch {epoch + 1}/{num_epochs}  train_loss={train_loss:.4f}  "
-                f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}",
-                flush=True,
+            _log.info(
+                "Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_acc=%.4f",
+                epoch + 1, num_epochs, train_loss, val_loss, val_acc,
             )
             if self.tb_writer:
                 self.tb_writer.add_scalar("loss/train", train_loss, epoch)

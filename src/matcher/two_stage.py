@@ -450,7 +450,7 @@ class TwoStagePipeline:
             if progress_every > 0:
                 done = min(start + len(batch_ids), len(ids))
                 if done % progress_every == 0:
-                    print(f"[validation] {done}/{len(ids)}", flush=True)
+                    logger.info("[validation] %s/%s", done, len(ids))
 
         if n_total == 0:
             return 0.0, 0.0

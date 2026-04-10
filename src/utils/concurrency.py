@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 _global_semaphore: Optional[threading.Semaphore] = None
 
 try:
-    from utils.config import PARALLEL_WORKERS
+    from config import PARALLEL_WORKERS
 except Exception:
     PARALLEL_WORKERS = 4
 

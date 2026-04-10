@@ -40,3 +40,16 @@
 8. **DiffNode / DiffFAISSNode / DiffBipartiteNode / DiffFuzzyNode / CFGMatchNode**：匹配
 
 **待新增**：`PcodeNormalizeNode`（5.3）——独立节点；当前规范化已并入 LSIRBuildNode。
+
+## ctx 键约定
+
+节点间通过 `ctx` 字典传递数据，主要键：
+
+| 键 | 写入节点 | 说明 |
+|----|---------|------|
+| `ghidra_output` | GhidraNode | Ghidra headless 分析结果（dict 或文件路径） |
+| `lsir` | LSIRBuildNode | LSIR 结构（含 cfg/dfg） |
+| `features` | FeatureExtractNode / ACFGExtractNode | 提取的特征 |
+| `embeddings` | EmbedNode | 函数向量嵌入 |
+| `db_embeddings` | LoadDBNode | 漏洞库嵌入 |
+| `diff_result` | DiffNode / DiffFAISSNode / DiffBipartiteNode / DiffFuzzyNode | 匹配结果 |

@@ -34,7 +34,7 @@ class UnpackNode(DAGNode):
     NODE_TYPE = "unpack"
 
     def execute(self, ctx: Dict[str, Any]) -> None:
-        from utils.config import BINWALK_CMD, PROJECT_ROOT, UNPACK_OUTPUT_DIR
+        from config import BINWALK_CMD, PROJECT_ROOT, UNPACK_OUTPUT_DIR
 
         p = self.params
         firmware_path = os.path.abspath(p["firmware_path"])

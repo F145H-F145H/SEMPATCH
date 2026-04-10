@@ -5,7 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from typing import Any, Dict, Optional, Set
 
-from utils.config import DAG_GHIDRA_THREAD_SLOTS, DAG_MAX_WORKERS
+from config import DAG_GHIDRA_THREAD_SLOTS, DAG_MAX_WORKERS
 
 from .model import JobDAG
 from .node_exec import build_run_node_fn

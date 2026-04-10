@@ -11,7 +11,7 @@ from subprocess import PIPE, STDOUT, Popen, TimeoutExpired
 from typing import List, Optional, Tuple
 
 from exceptions import SemPatchError
-from utils.config import ANALYZE_HEADLESS, BINARY_CACHE_DIR, GHIDRA_HOME, LOG_DIR
+from config import ANALYZE_HEADLESS, BINARY_CACHE_DIR, GHIDRA_HOME, LOG_DIR
 from utils.logger import get_logger
 
 logger = get_logger(

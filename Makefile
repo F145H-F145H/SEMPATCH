@@ -17,7 +17,7 @@ eval-dev:
 	@test -f $(EVAL_DEV_DATA)/library_features.json || (echo "缺少 $(EVAL_DEV_DATA)/library_features.json"; exit 1)
 	@test -f $(EVAL_DEV_DATA)/library_safe_embeddings.json || (echo "缺少 $(EVAL_DEV_DATA)/library_safe_embeddings.json"; exit 1)
 	@mkdir -p output/benchmarks
-	$(PY) scripts/eval_two_stage.py \
+	$(PY) scripts/sidechain/eval_two_stage.py \
 		--data-dir $(EVAL_DEV_DATA) \
 		--coarse-k 100 \
 		-k 1 5 10 \
@@ -27,7 +27,7 @@ eval-real:
 	@test -f benchmarks/real_cve/query_embeddings.json || (echo "缺少 benchmarks/real_cve/query_embeddings.json，见 benchmarks/real_cve/README.md"; exit 1)
 	@test -f benchmarks/real_cve/library_embeddings.json || (echo "缺少 benchmarks/real_cve/library_embeddings.json"; exit 1)
 	@mkdir -p output/benchmarks
-	$(PY) scripts/eval_bcsd.py \
+	$(PY) scripts/sidechain/eval_bcsd.py \
 		--firmware-emb benchmarks/real_cve/query_embeddings.json \
 		--db-emb benchmarks/real_cve/library_embeddings.json \
 		--mode cve \
