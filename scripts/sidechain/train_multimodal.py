@@ -412,7 +412,7 @@ def main():
         from features.models.multimodal_fusion import parse_multimodal_checkpoint
 
         try:
-            raw = torch.load(args.init_weights, map_location=device, weights_only=False)
+            raw = torch.load(args.init_weights, map_location=device, weights_only=True)
         except TypeError:
             raw = torch.load(args.init_weights, map_location=device)
         sd, _meta = parse_multimodal_checkpoint(raw)

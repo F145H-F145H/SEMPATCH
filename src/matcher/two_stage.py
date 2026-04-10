@@ -233,9 +233,8 @@ class _LibraryFeaturesLazy:
         if self._index is None or key not in self._index:
             raise KeyError(key)
         start, end = self._index[key]
-        assert self._fd is not None
-        self._fd.seek(start)
-        raw = self._fd.read(end - start)
+        assert self._mm is not None
+        raw = bytes(self._mm[start:end])
         return json.loads(raw)
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -244,9 +243,8 @@ class _LibraryFeaturesLazy:
         if self._index is None or key not in self._index:
             return default
         start, end = self._index[key]
-        assert self._fd is not None
-        self._fd.seek(start)
-        raw = self._fd.read(end - start)
+        assert self._mm is not None
+        raw = bytes(self._mm[start:end])
         return json.loads(raw)
 
     def __len__(self) -> int:

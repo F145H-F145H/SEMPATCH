@@ -1,5 +1,6 @@
 """ACFG 基线适配器：extract_acfg_features + 哈希投影到 128 维。"""
 
+import hashlib
 from typing import Any, Dict, List, Optional
 
 from features.baselines.base import BaseSimilarityModel
@@ -53,7 +54,7 @@ class ACFGModel(BaseSimilarityModel):
         # 基本块 opcode 哈希投影
         for nf in acfg.get("node_features", []):
             for opcode in nf.get("pcode_opcodes", []):
-                h = hash(opcode) % self._HASH_DIM
+                h = int(hashlib.md5(opcode.encode("utf-8")).hexdigest(), 16) % self._HASH_DIM
                 vec[h] += 1.0
 
         # L2 归一化

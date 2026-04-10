@@ -212,6 +212,9 @@ def _embed_baseline(features: Dict[str, Any]) -> List[Dict[str, Any]]:
                     opcodes = n if isinstance(n, list) else n.get("pcode_opcodes", []) or []
                     tokens.extend(opcodes)
         token_str = "|".join(str(t) for t in tokens)
+        if not token_str:
+            out.append({"name": name, "vector": [0.0] * 128})
+            continue
         digest = hashlib.md5(token_str.encode("utf-8")).digest()
         vec = [0.0] * 128
         for i in range(128):

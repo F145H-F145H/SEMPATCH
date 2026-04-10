@@ -5,6 +5,8 @@ Phase 0: 从大量 BinKit ELF 中智能筛选训练子集。
 - 按 project_id 分组，优先保留多变体项目
 - 输出选中子集的 binary 索引 JSON
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os

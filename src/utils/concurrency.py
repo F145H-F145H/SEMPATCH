@@ -32,9 +32,13 @@ def get_global_semaphore() -> threading.Semaphore:
 
 
 def bounded_task(sem: threading.Semaphore, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-    sem.acquire()
+    if not sem.acquire(timeout=300.0):
+        raise TimeoutError("bounded_task: semaphore acquire timed out after 300s")
     try:
         return fn(*args, **kwargs)
+    except Exception:
+        logger.exception("bounded_task: %s raised an exception", fn)
+        raise
     finally:
         sem.release()
 

@@ -21,7 +21,7 @@ def _fuzzy_compare(h1: str, h2: str, algorithm: str) -> float:
         except ImportError:
             pass
         except Exception:
-            pass
+            logger.debug("ssdeep.compare 失败", exc_info=True)
     if algorithm == "tlsh":
         try:
             import tlsh
@@ -32,7 +32,7 @@ def _fuzzy_compare(h1: str, h2: str, algorithm: str) -> float:
         except ImportError:
             pass
         except Exception:
-            pass
+            logger.debug("tlsh.diff 失败", exc_info=True)
     return 0.0
 
 
