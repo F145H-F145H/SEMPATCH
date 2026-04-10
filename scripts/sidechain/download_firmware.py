@@ -92,6 +92,7 @@ def main() -> None:
         return
 
     to_download = [d for d in DOWNLOADABLE if args.name is None or d["name"] == args.name]
+    failed = 0
     for d in to_download:
         ext = ".img.gz" if d["decompress"] else ""
         base = d["name"] + ext
@@ -101,7 +102,14 @@ def main() -> None:
             print(f"已存在，跳过: {out_final}")
             continue
         print(f"下载 {d['name']} ...")
-        download_url(d["url"], dest, decompress=d["decompress"])
+        try:
+            download_url(d["url"], dest, decompress=d["decompress"])
+        except RuntimeError as e:
+            print(f"警告: {e}", file=sys.stderr)
+            failed += 1
+
+    if failed:
+        print(f"警告: {failed}/{len(to_download)} 个固件下载失败", file=sys.stderr)
 
     print(f"\n固件目录: {args.out}")
 

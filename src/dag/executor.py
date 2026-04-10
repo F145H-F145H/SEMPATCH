@@ -1,5 +1,6 @@
 """DAG 执行器：线程池调度、就绪队列、重试、防重复。"""
 
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from typing import Any, Dict, Optional, Set
@@ -8,6 +9,8 @@ from utils.config import DAG_GHIDRA_THREAD_SLOTS, DAG_MAX_WORKERS
 
 from .model import JobDAG
 from .node_exec import build_run_node_fn
+
+logger = logging.getLogger(__name__)
 
 
 def run_dag(
@@ -114,6 +117,7 @@ def run_dag(
                             ok = f.result()
                             on_node_done(fnid, ok)
                         except Exception:
+                            logger.warning("节点 %s 执行失败", fnid, exc_info=True)
                             on_node_done(fnid, False)
                 continue
 
@@ -127,6 +131,7 @@ def run_dag(
                 ok = f.result()
                 on_node_done(nid, ok)
             except Exception:
+                logger.warning("节点 %s 执行失败", nid, exc_info=True)
                 on_node_done(nid, False)
 
     return ctx

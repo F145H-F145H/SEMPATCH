@@ -305,14 +305,8 @@ def main():
             sys.exit(1)
 
     # 13.4：随机种子管理，保证可复现
-    seed = args.seed
-    torch.manual_seed(seed)
-    random.seed(seed)
-    try:
-        import numpy
-        numpy.random.seed(seed)
-    except ImportError:
-        pass
+    from experiment_meta import set_deterministic
+    set_deterministic(args.seed)
 
     default_index = os.path.join(PROJECT_ROOT, "data", "binkit_functions.json")
     default_save = os.path.join(PROJECT_ROOT, "output", "best_model.pth")
@@ -702,6 +696,9 @@ def main():
         log_batches_every=max(1, int(args.progress_log_every)),
         cleanup_every_epoch=(not args.no_epoch_cleanup),
     )
+    # 写入实验 metadata
+    from experiment_meta import save_metadata
+    save_metadata(save_path, args, extra=ckpt_meta)
     print(f"最佳模型已保存至 {save_path}")
 
 

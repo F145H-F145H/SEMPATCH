@@ -7,6 +7,7 @@
 1. **写任何代码前**必须完整阅读 `memory-bank/@architecture.md`（包含完整数据结构）
 2. **写任何代码前**必须完整阅读 `memory-bank/@design-document.md`
 3. **每完成一个重大功能或里程碑后**，必须更新 `memory-bank/@architecture.md`
+4. **每完成一个重大功能或里程碑后**，将进度、回归与已知限制记入 `memory-bank/progress.md`
 
 <a id="synthetic-short-path"></a>
 
@@ -56,6 +57,22 @@ PYTHONPATH=src python scripts/eval_bcsd.py \
 
 若已准备 `data/two_stage/`（见下文「两阶段流水线」与 [two_stage_split.md](two_stage_split.md)），或仅需 CLI 冒烟，可使用 `scripts/eval_two_stage.py`；与 Demo 脚本关系见 [DEMO.md「主流程与相关脚本」](DEMO.md#主流程与相关脚本)。
 
+<a id="benchmarks-eval"></a>
+
+## 固化评测基准（`benchmarks/`）
+
+三把固定「尺子」，路径约定见 [`benchmarks/README.md`](../benchmarks/README.md)：
+
+- **smoke**：`benchmarks/smoke/fake_cve` + `benchmarks/smoke/two_stage`（无 Ghidra）
+- **dev_binkit**：固定 `prepare_two_stage_data --seed 42` 与清单（`benchmarks/dev_binkit/manifest.json`）；大体积特征写入 `benchmarks/dev_binkit/artifacts/`（默认 gitignore）
+- **real_cve**：`benchmarks/real_cve/query_embeddings.json` 与 `library_embeddings.json`（gitignore），供 `eval_bcsd --mode cve`
+
+```bash
+make eval-smoke    # pytest -m fake_cve
+make eval-dev      # 需先按 benchmarks/dev_binkit/README.md 材质化 artifacts + output/best_model.pth
+make eval-real     # 需先在 real_cve 目录放置两份嵌入 JSON
+```
+
 <a id="testing-pytest"></a>
 
 ## 测试
@@ -86,6 +103,7 @@ scripts/train_safe.py --index-file data/binkit_functions_filtered.json --precomp
 
 ## 相关文档
 
+- [memory-bank/progress.md](../memory-bank/progress.md)：实施进度、回归记录与工程限制
 - [memory-bank/@architecture.md](../memory-bank/@architecture.md)：完整数据结构、节点契约、模块接口
 - [memory-bank/@design-document.md](../memory-bank/@design-document.md)：技术栈、目录结构、流程、方案、评估计划
-- [memory-bank/@implementation-plan.md](../memory-bank/@implementation-plan.md)：面向 AI 的分步实施指令
+- [memory-bank/@implementation-plan.md](../memory-bank/@implementation-plan.md)：面向 AI 的分步实施指令（若本地存在）

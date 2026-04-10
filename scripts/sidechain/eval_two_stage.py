@@ -55,7 +55,7 @@ def _refuse_unbounded_json_loads(
     lines.append(
         f"CLI 默认拒绝单文件大于 {_human_bytes(max_bytes)} 的输入。"
         "若你确认内存与磁盘充足，请添加 --allow-large-inputs。"
-        "冒烟/开发请使用: --data-dir tests/fixtures/two_stage_cli_smoke"
+        "冒烟/开发请使用: --data-dir benchmarks/smoke/two_stage"
     )
     print("\n".join(lines), file=sys.stderr)
     sys.exit(2)
@@ -128,7 +128,7 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         default=os.path.join(PROJECT_ROOT, "data", "two_stage"),
-        help="两阶段数据目录（默认 data/two_stage）。冒烟请用 tests/fixtures/two_stage_cli_smoke",
+        help="两阶段数据目录（默认 data/two_stage）。冒烟请用 benchmarks/smoke/two_stage",
     )
     parser.add_argument(
         "--allow-large-inputs",
@@ -230,11 +230,50 @@ def main() -> None:
         rerank_model_path=model_path,
     )
 
+    # ------------------------------------------------------------------
+    # 逐查询执行：粗筛 + 精排分步，收集每查询诊断信息
+    # ------------------------------------------------------------------
     ranked_ids_per_query: dict[str, list[str]] = {}
-    for query_id in valid_query_ids:
-        results = pipeline.retrieve_and_rerank(query_id)
-        ranked_ids_per_query[query_id] = [cid for cid, _ in results]
+    total_queries = 0
+    coarse_hit_count = 0        # 粗筛候选中包含正样本的查询数
+    rerank_skipped_count = 0    # 精排被跳过的查询数（无候选 / 特征缺失）
+    tied_top_count = 0          # Top-1 与 Top-2 精排得分并列的查询数
+    rerank_ran_count = 0        # 精排实际执行的查询数
 
+    for query_id in valid_query_ids:
+        total_queries += 1
+        positives = set(ground_truth.get(query_id) or [])
+
+        # 1. 粗筛
+        coarse_ids = pipeline.retrieve(query_id)
+        if positives and any(cid in positives for cid in coarse_ids):
+            coarse_hit_count += 1
+
+        # 2. 精排
+        if not coarse_ids:
+            ranked_ids_per_query[query_id] = []
+            rerank_skipped_count += 1
+            continue
+
+        reranked = pipeline.rerank(query_id, coarse_ids)
+        rerank_ran_count += 1
+
+        if not reranked:
+            ranked_ids_per_query[query_id] = []
+            rerank_skipped_count += 1
+            continue
+
+        ranked_ids_per_query[query_id] = [cid for cid, _ in reranked]
+
+        # 3. 检测并列 Top
+        if len(reranked) >= 2:
+            s0, s1 = reranked[0][1], reranked[1][1]
+            if abs(s0 - s1) < 1e-9:
+                tied_top_count += 1
+
+    # ------------------------------------------------------------------
+    # 聚合指标
+    # ------------------------------------------------------------------
     results: dict[str, dict[str, float]] = {}
     for k_val in args.k:
         if k_val < 1:
@@ -250,11 +289,51 @@ def main() -> None:
             f"Precision@K={m['precision_at_k']:.4f}, MRR={m['mrr']:.4f}"
         )
 
+    # ------------------------------------------------------------------
+    # 错误分析面板
+    # ------------------------------------------------------------------
+    coarse_hit_rate = (coarse_hit_count / total_queries) if total_queries > 0 else 0.0
+    fallback_rate = (rerank_skipped_count / total_queries) if total_queries > 0 else 0.0
+    tied_top_rate = (tied_top_count / rerank_ran_count) if rerank_ran_count > 0 else 0.0
+
+    diagnostics = {
+        "coarse_hit_rate": round(coarse_hit_rate, 4),
+        "fallback_rate": round(fallback_rate, 4),
+        "tied_top_rate": round(tied_top_rate, 4),
+        "total_queries": total_queries,
+        "coarse_hit_count": coarse_hit_count,
+        "rerank_skipped_count": rerank_skipped_count,
+        "tied_top_count": tied_top_count,
+        "rerank_ran_count": rerank_ran_count,
+    }
+
+    # 终端诊断摘要
+    print()
+    print("--- 错误分析面板 ---")
+    print(f"  coarse_hit_rate  = {coarse_hit_rate:.4f}  ({coarse_hit_count}/{total_queries} 个查询的正样本在粗筛 Top-{args.coarse_k} 中)")
+    if coarse_hit_rate < 0.8:
+        print(f"    ⚠ 粗筛漏召回高 → 增大 --coarse-k 或优化 SAFE 嵌入权重")
+    print(f"  fallback_rate    = {fallback_rate:.4f}  ({rerank_skipped_count}/{total_queries} 个查询未经过精排)")
+    if fallback_rate > 0.05:
+        print(f"    ⚠ 精排跳过率高 → 检查候选特征是否缺失，或库特征文件过大触发内存降级")
+    print(f"  tied_top_rate    = {tied_top_rate:.4f}  ({tied_top_count}/{rerank_ran_count} 个精排查询 Top-1/Top-2 并列)")
+    if tied_top_rate > 0.1:
+        print(f"    ⚠ 并列率高 → 精排模型区分度不足，考虑增加训练数据或调整模型架构")
+
+    # ------------------------------------------------------------------
+    # 输出 JSON（含诊断字段）
+    # ------------------------------------------------------------------
     if args.output:
+        from experiment_meta import collect_metadata
         out_path = os.path.abspath(args.output)
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        output_data = {
+            "metrics": results,
+            "diagnostics": diagnostics,
+            "metadata": collect_metadata(args),
+        }
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+            json.dump(output_data, f, indent=2, ensure_ascii=False, default=str)
         print(f"结果已写入 {out_path}")
 
 

@@ -112,8 +112,8 @@ def test_load_embeddings_cve_as_list(tmp_path):
 
 
 def test_load_embeddings_fixture_fake_cve():
-    """tests/fixtures/fake_cve 含非空 cve 列表，加载无异常。"""
-    path = os.path.join(_project_root, "tests", "fixtures", "fake_cve", "library_embeddings.json")
+    """benchmarks/smoke/fake_cve 含非空 cve 列表，加载无异常。"""
+    path = os.path.join(_project_root, "benchmarks", "smoke", "fake_cve", "library_embeddings.json")
     assert os.path.isfile(path)
     names, vectors, cves = load_embeddings(path)
     assert len(names) >= 1

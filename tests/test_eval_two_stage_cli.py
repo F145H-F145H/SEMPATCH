@@ -15,7 +15,7 @@ def _project_root() -> str:
 def test_eval_two_stage_smoke_fixture_runs() -> None:
     root = _project_root()
     script = os.path.join(root, "scripts", "eval_two_stage.py")
-    data_dir = os.path.join(root, "tests", "fixtures", "two_stage_cli_smoke")
+    data_dir = os.path.join(root, "benchmarks", "smoke", "two_stage")
     py = sys.executable
     r = subprocess.run(
         [
@@ -74,3 +74,50 @@ def test_eval_two_stage_rejects_huge_files(tmp_path) -> None:
     )
     assert r.returncode == 2
     assert "过大" in r.stderr or "OOM" in r.stderr
+
+
+def test_eval_two_stage_outputs_diagnostics(tmp_path) -> None:
+    """输出 JSON 包含 metrics 与 diagnostics 字段，终端打印错误分析面板。"""
+    root = _project_root()
+    script = os.path.join(root, "scripts", "eval_two_stage.py")
+    data_dir = os.path.join(root, "benchmarks", "smoke", "two_stage")
+    out_file = str(tmp_path / "diag.json")
+    py = sys.executable
+    r = subprocess.run(
+        [
+            py,
+            script,
+            "--data-dir",
+            data_dir,
+            "--max-queries",
+            "1",
+            "-k",
+            "1",
+            "--output",
+            out_file,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+
+    # 终端输出包含错误分析面板
+    assert "coarse_hit_rate" in r.stdout
+    assert "fallback_rate" in r.stdout
+    assert "tied_top_rate" in r.stdout
+
+    # 输出 JSON 包含 diagnostics 字段
+    data = json.loads(open(out_file, encoding="utf-8").read())
+    assert "metrics" in data
+    assert "diagnostics" in data
+    diag = data["diagnostics"]
+    assert "coarse_hit_rate" in diag
+    assert "fallback_rate" in diag
+    assert "tied_top_rate" in diag
+    assert "total_queries" in diag
+    assert diag["total_queries"] == 1
+    assert 0.0 <= diag["coarse_hit_rate"] <= 1.0
+    assert 0.0 <= diag["fallback_rate"] <= 1.0
+    assert 0.0 <= diag["tied_top_rate"] <= 1.0

@@ -257,10 +257,15 @@ def main() -> None:
         print(f"{k_label}: Recall@K={m['recall_at_k']:.4f}, Precision@K={m['precision_at_k']:.4f}, MRR={m['mrr']:.4f}")
 
     if args.output:
+        from experiment_meta import collect_metadata
         out_path = os.path.abspath(args.output)
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        output_data = {
+            "metrics": results,
+            "metadata": collect_metadata(args),
+        }
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+            json.dump(output_data, f, indent=2, ensure_ascii=False, default=str)
         print(f"结果已写入 {out_path}")
 
 

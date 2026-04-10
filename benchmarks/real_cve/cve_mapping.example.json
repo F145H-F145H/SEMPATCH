@@ -1,0 +1,10 @@
+{
+  "mappings": [
+    {
+      "binary": "path/relative/to/repo/vulnerable.elf",
+      "cve": "CVE-2099-0001",
+      "name": "",
+      "entry": ""
+    }
+  ]
+}

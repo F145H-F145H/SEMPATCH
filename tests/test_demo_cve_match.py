@@ -63,9 +63,9 @@ def test_build_candidates_no_dedupe_same_name():
 
 
 def test_two_stage_run_demo_fake_cve_fixture(tmp_path):
-    """与 tests/fixtures/fake_cve 对齐：直接调 run_demo（等价原 demo_cve_match 子进程）。"""
+    """与 benchmarks/smoke/fake_cve 对齐：直接调 run_demo（等价原 demo_cve_match 子进程）。"""
     root = _project_root
-    fx = os.path.join(root, "tests", "fixtures", "fake_cve")
+    fx = os.path.join(root, "benchmarks", "smoke", "fake_cve")
     out = tmp_path / "demo_out"
     _demo.run_demo(
         query_features_path=os.path.join(fx, "query_features.json"),
@@ -137,7 +137,7 @@ def test_format_match_explanation_zh():
 def test_two_stage_dup_names_two_fake_cves_in_topk(tmp_path):
     """库中两函数同名 dup、CVE 为 FAKE-CVE-0001 / FAKE-CVE-0002；top_k=2 两条候选均保留。"""
     root = _project_root
-    fx = os.path.join(root, "tests", "fixtures", "fake_cve")
+    fx = os.path.join(root, "benchmarks", "smoke", "fake_cve")
     out = tmp_path / "demo_out2"
     _demo.run_demo(
         query_features_path=os.path.join(fx, "query_features.json"),

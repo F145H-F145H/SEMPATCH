@@ -77,11 +77,11 @@ def load_candidate_features(
 
 def load_candidate_features_from_dict(
     candidate_ids: Sequence[str],
-    lib_features: Dict[str, Any],
+    lib_features: Any,
 ) -> List[Tuple[str, dict]]:
-    """从已加载的库特征 dict 中按 id 获取 multimodal 特征。"""
-    if not isinstance(lib_features, dict):
-        raise ValueError("lib_features 必须为 dict")
+    """从已加载的库特征 dict（或 dict-like 映射）中按 id 获取 multimodal 特征。"""
+    if not hasattr(lib_features, "get"):
+        raise ValueError("lib_features 必须支持 .get() (dict-like)")
     result: List[Tuple[str, dict]] = []
     for cid in candidate_ids:
         mm = lib_features.get(cid)

@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from matcher.two_stage import TwoStagePipeline
+from matcher.two_stage import TwoStagePipeline, _LibraryFeaturesLazy
 
 
 def _minimal_multimodal(pcode_tokens=None, node_features=None):
@@ -150,3 +150,159 @@ def test_two_stage_pipeline_no_dag_import():
 
     dag_after = [k for k in sys.modules if "dag" in k and k.startswith("dag")]
     assert set(dag_after) == set(dag_modules), "导入 two_stage 不应引入 dag 模块"
+
+
+# ------------------------------------------------------------------
+# _LibraryFeaturesLazy 单元测试
+# ------------------------------------------------------------------
+
+
+def _make_library_features_json(tmp_path, entries):
+    """构造 library_features.json 并返回路径。"""
+    path = tmp_path / "lib_features.json"
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    return str(path)
+
+
+class TestLibraryFeaturesLazyEager:
+    """小文件走 eager 路径。"""
+
+    def test_contains_and_getitem(self, tmp_path):
+        data = {"a|0x1": {"graph": {"num_nodes": 1}, "sequence": {"pcode_tokens": ["X"]}}}
+        p = _make_library_features_json(tmp_path, data)
+        lf = _LibraryFeaturesLazy(p)
+        assert "a|0x1" in lf
+        assert "b|0x2" not in lf
+        assert lf["a|0x1"]["graph"]["num_nodes"] == 1
+        with pytest.raises(KeyError):
+            _ = lf["missing"]
+        assert lf.get("missing") is None
+        assert lf.get("a|0x1") is not None
+        assert len(lf) == 1
+        assert "a|0x1" in list(lf.keys())
+
+    def test_getitem_roundtrip(self, tmp_path):
+        data = {f"k|0x{i}": {"v": i} for i in range(50)}
+        p = _make_library_features_json(tmp_path, data)
+        lf = _LibraryFeaturesLazy(p)
+        for k, v in data.items():
+            assert lf[k] == v
+
+
+class TestLibraryFeaturesLazyIndex:
+    """大文件走 lazy index 路径。"""
+
+    @staticmethod
+    def _pad_to_threshold(tmp_path, path_str, threshold):
+        """给文件填充注释使其超过阈值，触发 lazy 模式。"""
+        import pathlib
+        p = pathlib.Path(path_str)
+        content = p.read_bytes()
+        pad = b" " * max(0, threshold - len(content) + 1)
+        # 在尾部 '}' 之前插入空白
+        p.write_bytes(content[:-1] + pad + b"}")
+
+    def test_index_lookup_matches_eager(self, tmp_path):
+        data = {
+            "lib_func_1|0x1000": {"graph": {"num_nodes": 3}, "sequence": {"pcode_tokens": ["A", "B"]}},
+            "lib_func_2|0x2000": {"graph": {"num_nodes": 5}, "sequence": {"pcode_tokens": ["C", "D", "E"]}},
+            "lib_func_3|0x3000": {"graph": {"num_nodes": 1}, "sequence": {"pcode_tokens": ["X"]}},
+        }
+        p = _make_library_features_json(tmp_path, data)
+        # 强制走 index 路径
+        lf = _LibraryFeaturesLazy(p, eager_threshold=0)
+        for k, v in data.items():
+            assert k in lf
+            assert lf[k] == v
+            assert lf.get(k) == v
+        assert "nonexistent" not in lf
+        assert lf.get("nonexistent") is None
+        assert len(lf) == 3
+        lf.close()
+
+    def test_index_with_nested_values(self, tmp_path):
+        """嵌套对象、数组、字符串、数字、布尔、null 均正确解析。"""
+        data = {
+            "f1": {
+                "graph": {
+                    "num_nodes": 2,
+                    "edge_index": [[0, 1], [1, 0]],
+                    "node_features": [["COPY", "LOAD"], ["STORE"]],
+                },
+                "sequence": {
+                    "pcode_tokens": ["COPY", "LOAD", "STORE"],
+                    "jump_mask": [0, 1, 0],
+                    "seq_len": 3,
+                },
+                "extra": {"nested": {"deep": True, "val": None}},
+            },
+        }
+        p = _make_library_features_json(tmp_path, data)
+        lf = _LibraryFeaturesLazy(p, eager_threshold=0)
+        assert lf["f1"]["graph"]["edge_index"] == [[0, 1], [1, 0]]
+        assert lf["f1"]["extra"]["nested"]["deep"] is True
+        assert lf["f1"]["extra"]["nested"]["val"] is None
+        lf.close()
+
+    def test_index_with_many_keys(self, tmp_path):
+        """大量 key 时索引正确。"""
+        n = 200
+        data = {f"func_{i}|0x{i:x}": {"graph": {"num_nodes": i}, "sequence": {"pcode_tokens": ["X"] * (i % 5 + 1)}} for i in range(n)}
+        p = _make_library_features_json(tmp_path, data)
+        lf = _LibraryFeaturesLazy(p, eager_threshold=0)
+        assert len(lf) == n
+        # 抽查几个
+        assert lf["func_0|0x0"]["graph"]["num_nodes"] == 0
+        assert lf["func_99|0x63"]["graph"]["num_nodes"] == 99
+        assert lf["func_199|0xc7"]["graph"]["num_nodes"] == 199
+        assert "func_999|0x3e7" not in lf
+        lf.close()
+
+
+class TestTwoStagePipelineLazyFeatures:
+    """TwoStagePipeline + 惰性 library features 集成。"""
+
+    def test_pipeline_with_lazy_library_features(self, tmp_path):
+        """大 library_features.json 触发 lazy index，pipeline 正常工作。"""
+        mm = _minimal_multimodal()
+        emb = {
+            "functions": [
+                {"function_id": "lib|0x1", "vector": [0.5] * 128},
+                {"function_id": "lib|0x2", "vector": [0.3] * 128},
+            ]
+        }
+        # 构造较大的 library_features 以触发 lazy
+        lib_features = {}
+        for i in range(100):
+            lib_features[f"lib|0x{i:x}"] = _minimal_multimodal(
+                pcode_tokens=["COPY", "INT_ADD"] * (i % 3 + 1)
+            )
+        # 确保实际用到的 key 存在
+        lib_features["lib|0x1"] = mm
+        lib_features["lib|0x2"] = _minimal_multimodal(pcode_tokens=["X", "Y"])
+
+        emb_path = tmp_path / "emb.json"
+        lf_path = tmp_path / "lib_feat.json"
+        qf_path = tmp_path / "qf.json"
+        emb_path.write_text(json.dumps(emb), encoding="utf-8")
+        qf_path.write_text(json.dumps({"query|0x1": mm}), encoding="utf-8")
+        lf_path.write_text(json.dumps(lib_features), encoding="utf-8")
+
+        # 强制走 lazy 路径
+        import matcher.two_stage as ts_mod
+        orig_threshold = ts_mod._EAGER_LOAD_THRESHOLD_BYTES
+        ts_mod._EAGER_LOAD_THRESHOLD_BYTES = 0
+        try:
+            pipeline = TwoStagePipeline(
+                library_safe_embeddings_path=str(emb_path),
+                library_features_path=str(lf_path),
+                query_features_path=str(qf_path),
+                coarse_k=5,
+            )
+            result = pipeline.retrieve_and_rerank("query|0x1")
+            assert isinstance(result, list)
+            if result:
+                for i in range(len(result) - 1):
+                    assert result[i][1] >= result[i + 1][1]
+        finally:
+            ts_mod._EAGER_LOAD_THRESHOLD_BYTES = orig_threshold

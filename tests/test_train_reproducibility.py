@@ -102,3 +102,14 @@ def test_seed_reproducibility():
     loss1 = run_with_seed(seed)
     loss2 = run_with_seed(seed)
     assert loss1 == loss2, f"相同 seed 下 loss 应一致: {loss1} vs {loss2}"
+
+
+def test_deterministic_flags_set():
+    """set_deterministic 设置 cuDNN deterministic/benchmark 与 PYTHONHASHSEED。"""
+    import torch
+    from experiment_meta import set_deterministic
+
+    set_deterministic(42)
+    assert torch.backends.cudnn.deterministic is True
+    assert torch.backends.cudnn.benchmark is False
+    assert os.environ.get("PYTHONHASHSEED") == "42"

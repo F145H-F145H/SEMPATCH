@@ -5,6 +5,11 @@ third_party/
 output/
 data/
 
+# Benchmark materialization (large JSON / embeddings; keep manifests & split under version control)
+benchmarks/dev_binkit/artifacts/
+benchmarks/real_cve/query_embeddings.json
+benchmarks/real_cve/library_embeddings.json
+
 # Python
 __pycache__/
 *.pyc
@@ -25,10 +30,15 @@ sempatch.cfg
 .cursor/
 .lingma/
 
-# Developer notes (contains hardcoded local paths)
-memory-bank/
-TODO.md
-项目现状.md
+# Developer notes: ignore memory-bank except canonical tracked files
+memory-bank/*
+!memory-bank/progress.md
+!memory-bank/@architecture.md
+!memory-bank/@design-document.md
 
 # Root-level artifacts
 out.json
+requirements_frozen.txt
+
+# Docker
+.docker-data/

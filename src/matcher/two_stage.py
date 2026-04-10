@@ -8,12 +8,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .faiss_library import LibraryFaissIndex, retrieve_coarse, retrieve_coarse_many
 from .rerank import RerankModel, load_candidate_features_from_dict
+
+logger = logging.getLogger(__name__)
+
+# 小于此阈值的 library_features.json 全量加载（避免 seek 索引开销）；
+# 超过此阈值则构建 key→byte-offset 索引，精排时按需读取。
+_EAGER_LOAD_THRESHOLD_BYTES = 100 * 1024 * 1024  # 100 MiB
 
 
 def _default_rerank_model_path() -> str:
@@ -21,6 +28,244 @@ def _default_rerank_model_path() -> str:
     # src/matcher/two_stage.py -> 上三级 -> 项目根
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     return os.path.join(root, "output", "best_model.pth")
+
+
+def _find_json_value_end(data: bytes, start: int) -> int:
+    """
+    从 data[start:] 开始，找到与 start 位置 JSON 值配对的结束位置。
+    支持嵌套对象/数组、字符串、数字、布尔、null。
+    返回值结束后第一个非空白字符的字节偏移。
+    """
+    i = start
+    n = len(data)
+    # 跳过前导空白
+    while i < n and data[i] in (0x20, 0x09, 0x0A, 0x0D):
+        i += 1
+    if i >= n:
+        return n
+
+    ch = data[i]
+    if ch == 0x7B:  # '{'
+        depth = 1
+        i += 1
+        in_str = False
+        esc = False
+        while i < n and depth > 0:
+            c = data[i]
+            if esc:
+                esc = False
+            elif c == 0x5C and in_str:  # backslash
+                esc = True
+            elif c == 0x22 and not in_str:  # '"'
+                in_str = True
+            elif c == 0x22 and in_str:  # '"'
+                in_str = False
+            elif not in_str:
+                if c == 0x7B:
+                    depth += 1
+                elif c == 0x7D:
+                    depth -= 1
+            i += 1
+        return i
+    elif ch == 0x5B:  # '['
+        depth = 1
+        i += 1
+        in_str = False
+        esc = False
+        while i < n and depth > 0:
+            c = data[i]
+            if esc:
+                esc = False
+            elif c == 0x5C and in_str:
+                esc = True
+            elif c == 0x22 and not in_str:
+                in_str = True
+            elif c == 0x22 and in_str:
+                in_str = False
+            elif not in_str:
+                if c == 0x5B:
+                    depth += 1
+                elif c == 0x5D:
+                    depth -= 1
+            i += 1
+        return i
+    elif ch == 0x22:  # '"'
+        i += 1
+        esc = False
+        while i < n:
+            c = data[i]
+            if esc:
+                esc = False
+            elif c == 0x5C:
+                esc = True
+            elif c == 0x22:
+                i += 1
+                return i
+            i += 1
+        return n
+    else:
+        # number / true / false / null — 扫到 , } ] 或空白
+        while i < n and data[i] not in (0x2C, 0x7D, 0x5D, 0x20, 0x09, 0x0A, 0x0D):
+            i += 1
+        return i
+
+
+class _LibraryFeaturesLazy:
+    """
+    惰性加载的 library_features 索引。
+
+    小文件：一次性 json.load，行为等价 dict。
+    大文件：首扫构建 key→(start, end) 字节偏移索引，
+            get() 时只读取并解析目标 key 的 JSON 切片。
+    """
+
+    def __init__(self, path: str, *, eager_threshold: int = _EAGER_LOAD_THRESHOLD_BYTES) -> None:
+        self._path = path
+        self._eager: Optional[Dict[str, Any]] = None
+        self._index: Optional[Dict[str, Tuple[int, int]]] = None
+        self._fd: Optional[Any] = None
+
+        try:
+            file_size = os.path.getsize(path)
+        except OSError:
+            file_size = 0
+
+        if file_size <= eager_threshold:
+            self._load_eager()
+        else:
+            self._build_index()
+
+    # ------------------------------------------------------------------
+    # Eager path (small files)
+    # ------------------------------------------------------------------
+
+    def _load_eager(self) -> None:
+        with open(self._path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"library_features 格式应为 {{function_id: multimodal}}，"
+                f"实际得到 {type(data).__name__}"
+            )
+        self._eager = data
+
+    # ------------------------------------------------------------------
+    # Lazy path (large files)
+    # ------------------------------------------------------------------
+
+    def _build_index(self) -> None:
+        """
+        扫描 JSON 文件，建立 top-level key → 字节偏移映射。
+        文件格式假定为 {"key1": value1, "key2": value2, ...}，
+        key 均为字符串，value 为任意 JSON 值。
+        """
+        self._index = {}
+        self._fd = open(self._path, "rb")
+        buf = self._fd.read()
+        n = len(buf)
+
+        # 定位到第一个 '{'
+        i = 0
+        while i < n and buf[i] != 0x7B:
+            i += 1
+        i += 1  # skip '{'
+
+        while i < n:
+            # 跳过空白和逗号
+            while i < n and buf[i] in (0x20, 0x09, 0x0A, 0x0D, 0x2C):
+                i += 1
+            if i >= n or buf[i] == 0x7D:  # '}'
+                break
+
+            # 解析 key: "... "
+            if buf[i] != 0x22:  # '"'
+                break
+            key_start = i + 1
+            i += 1
+            esc = False
+            while i < n:
+                c = buf[i]
+                if esc:
+                    esc = False
+                elif c == 0x5C:
+                    esc = True
+                elif c == 0x22:
+                    break
+                i += 1
+            key_end = i
+            key = buf[key_start:key_end].decode("utf-8", errors="replace")
+            i += 1  # skip closing '"'
+
+            # 跳过 ':'
+            while i < n and buf[i] in (0x20, 0x09, 0x0A, 0x0D, 0x3A):
+                i += 1
+
+            # 记录 value 的起始位置
+            val_start = i
+            val_end = _find_json_value_end(buf, i)
+            self._index[key] = (val_start, val_end)
+            i = val_end
+
+        logger.info(
+            "惰性 library_features 索引构建完成: %s, %d 个 key, 文件 %.1f MiB",
+            self._path,
+            len(self._index),
+            n / (1024 * 1024),
+        )
+
+    # ------------------------------------------------------------------
+    # dict-like interface
+    # ------------------------------------------------------------------
+
+    def __contains__(self, key: str) -> bool:
+        if self._eager is not None:
+            return key in self._eager
+        return self._index is not None and key in self._index
+
+    def __getitem__(self, key: str) -> Any:
+        if self._eager is not None:
+            return self._eager[key]
+        if self._index is None or key not in self._index:
+            raise KeyError(key)
+        start, end = self._index[key]
+        assert self._fd is not None
+        self._fd.seek(start)
+        raw = self._fd.read(end - start)
+        return json.loads(raw)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if self._eager is not None:
+            return self._eager.get(key, default)
+        if self._index is None or key not in self._index:
+            return default
+        start, end = self._index[key]
+        assert self._fd is not None
+        self._fd.seek(start)
+        raw = self._fd.read(end - start)
+        return json.loads(raw)
+
+    def __len__(self) -> int:
+        if self._eager is not None:
+            return len(self._eager)
+        return len(self._index) if self._index is not None else 0
+
+    def keys(self):  # noqa: ANN201
+        if self._eager is not None:
+            return self._eager.keys()
+        return self._index.keys() if self._index is not None else {}.keys()
+
+    def close(self) -> None:
+        if self._fd is not None:
+            self._fd.close()
+            self._fd = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        mode = "eager" if self._eager is not None else "lazy"
+        n = len(self)
+        return f"<_LibraryFeaturesLazy {mode} keys={n} path={self._path!r}>"
 
 
 class TwoStagePipeline:
@@ -75,14 +320,8 @@ class TwoStagePipeline:
                 f"实际得到 {type(self._query_features).__name__}"
             )
 
-        # library features 常驻内存（避免每个 query 读盘）
-        with open(library_features_path, encoding="utf-8") as f:
-            self._library_features: dict = json.load(f)
-        if not isinstance(self._library_features, dict):
-            raise ValueError(
-                f"library_features 格式应为 {{function_id: multimodal}}，"
-                f"实际得到 {type(self._library_features).__name__}"
-            )
+        # library features：小文件全量加载，大文件构建 key→偏移索引惰性读取
+        self._library_features = _LibraryFeaturesLazy(library_features_path)
 
         # 模型缓存：SAFE 粗筛 embedder + 精排模型
         from features.baselines.safe import SafeEmbedder

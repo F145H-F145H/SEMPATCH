@@ -130,6 +130,12 @@ def run_ghidra_analysis(
 
         logger.info("Ghidra headless analysis completed: %s (log: %s)", binary_path, ghidra_log_path)
 
+        # 验证输出文件非空（Ghidra exit 0 但输出为空是已知失败模式）
+        if os.path.isfile(script_output_path) and os.path.getsize(script_output_path) == 0:
+            raise RuntimeError(
+                f"Ghidra exited 0 but output is empty: {script_output_path}"
+            )
+
         write_to_binary_cache(script_output_path, script_output_name, binary_path)
 
         if return_dict:
@@ -201,10 +207,17 @@ def batch_run_ghidra(
             for future in as_completed(futures):
                 idx, json_path = future.result()
                 results[idx - 1] = json_path
-        return [p for p in results if p is not None]
+        succeeded = [p for p in results if p is not None]
+        failed = len(binary_paths) - len(succeeded)
+        if failed > 0:
+            logger.warning("Ghidra batch: %d/%d 二进制分析失败", failed, len(binary_paths))
+        return succeeded
     result = []
     for idx, bin_path in enumerate(binary_paths, start=1):
         _, json_path = _run_one((idx, bin_path))
         if json_path:
             result.append(json_path)
+    failed = len(binary_paths) - len(result)
+    if failed > 0:
+        logger.warning("Ghidra batch: %d/%d 二进制分析失败", failed, len(binary_paths))
     return result

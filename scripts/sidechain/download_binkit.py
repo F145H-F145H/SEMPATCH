@@ -87,7 +87,8 @@ def clone_via_zip(dest: str, proxy: str | None) -> bool:
                     with open(out, "wb") as f:
                         f.write(data)
             return True
-        except Exception:
+        except Exception as e:
+            print(f"  警告: zip 下载失败: {e}", file=sys.stderr)
             return False
         finally:
             try:

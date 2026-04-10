@@ -20,4 +20,4 @@ Original MVP vulnerable binary for testing the match pipeline.
 
 ## `fake_cve_demo/`
 
-Pre-computed features for testing without Ghidra. Used by `pytest -m fake_cve`.
+Pre-computed features for testing without Ghidra. JSON smoke data lives under `benchmarks/smoke/fake_cve` (`pytest -m fake_cve` / `make eval-smoke`).

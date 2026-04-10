@@ -19,7 +19,7 @@ def _root() -> str:
 
 
 def _fake_cve_dir() -> str:
-    return os.path.join(_root(), "tests", "fixtures", "fake_cve")
+    return os.path.join(_root(), "benchmarks", "smoke", "fake_cve")
 
 
 def _collect_cves_from_matches(data: dict) -> set[str]:

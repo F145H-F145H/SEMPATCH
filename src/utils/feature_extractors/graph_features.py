@@ -1,6 +1,9 @@
 """从 CFG/DFG 提取图特征。"""
 
+import logging
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 try:
     import networkx as nx
@@ -60,6 +63,11 @@ def extract_graph_features(
 
     out["cfg_weight"] = cfg_weight
     out["dfg_weight"] = dfg_weight
+
+    # 部分提取告警：CFG 为空但 DFG 非空
+    if not out["cfg"] and out.get("dfg") and out["dfg"].get("num_nodes", 0) > 0:
+        logger.warning("CFG 为空但 DFG 非空（%d 节点），图特征为部分提取", out["dfg"]["num_nodes"])
+
     return out
 
 

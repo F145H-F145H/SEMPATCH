@@ -8,7 +8,8 @@ Run the fake CVE match test to verify the pipeline works:
 
 ```bash
 source .venv/bin/activate
-pytest -m fake_cve -v
+make eval-smoke
+# or: pytest -m fake_cve -v
 ```
 
 This uses pre-computed features — no Ghidra, no compilation needed.

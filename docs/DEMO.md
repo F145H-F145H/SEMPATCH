@@ -17,9 +17,9 @@ M1 **产品入口**与 **同流水线评估** 均基于 **`matcher.two_stage.Two
 | **CVE 匹配报告（单一命名 Demo）** | [`scripts/demo_cve_match.py`](../scripts/demo_cve_match.py) | `matches.json`、`report.md`（及可选 `query_features.json`）；每条候选含 `cve` 数组等，见下文契约。 |
 | **两阶段检索指标** | [`scripts/eval_two_stage.py`](../scripts/eval_two_stage.py) | 在 `ground_truth.json`、`query_features.json`、库 SAFE 嵌入、`library_features.json` 上计算 Recall@K、Precision@K、MRR；**不**生成 CVE 报告，但与 Demo **共用** `TwoStagePipeline` 的粗筛 + 精排逻辑。 |
 
-**自动化冒烟**：[`tests/test_eval_two_stage_cli.py`](../tests/test_eval_two_stage_cli.py) 子进程调用 `eval_two_stage.py`，数据目录为 `tests/fixtures/two_stage_cli_smoke`。
+**自动化冒烟**：[`tests/test_eval_two_stage_cli.py`](../tests/test_eval_two_stage_cli.py) 子进程调用 `eval_two_stage.py`，数据目录为 `benchmarks/smoke/two_stage`。
 
-**人造 CVE 库（无 Ghidra）**：`tests/fixtures/fake_cve/`（`FAKE-CVE-*`）+ [`tests/test_fake_cve_match.py`](../tests/test_fake_cve_match.py)；验收：`pytest -m fake_cve`（`run_cve_match_pipeline` 与 `sempatch.py match`，不调用 `scripts/demo_cve_match.py`）。
+**人造 CVE 库（无 Ghidra）**：`benchmarks/smoke/fake_cve/`（`FAKE-CVE-*`）+ [`tests/test_fake_cve_match.py`](../tests/test_fake_cve_match.py)；验收：`pytest -m fake_cve` 或 `make eval-smoke`（`run_cve_match_pipeline` 与 `sempatch.py match`，不调用 `scripts/demo_cve_match.py`）。
 
 **根目录 `./sempatch` 双参数**：`./sempatch <查询ELF> <两阶段库目录>` 等价于 `python sempatch.py match --query-binary <ELF> --two-stage-dir <目录>`（库目录须含 `library_features.json` 或 `library_safe_embeddings.json`）；单参数非子命令时仍为 legacy `extract`。详见 [`sempatch_argv.py`](../sempatch_argv.py)。
 
@@ -27,7 +27,7 @@ M1 **产品入口**与 **同流水线评估** 均基于 **`matcher.two_stage.Two
 
 ```bash
 PYTHONPATH=src python scripts/eval_two_stage.py \
-  --data-dir tests/fixtures/two_stage_cli_smoke \
+  --data-dir benchmarks/smoke/two_stage \
   --max-queries 1 \
   -k 1
 ```

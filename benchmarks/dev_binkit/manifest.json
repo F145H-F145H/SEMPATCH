@@ -1,0 +1,14 @@
+{
+  "description": "BinKit 开发评测子集：二进制在本地 data/binkit_subset（Git 忽略 data/，不提交 ELF）。",
+  "binary_root_relative": "data/binkit_subset",
+  "index_relative": "data/binkit_functions.json",
+  "filtered_index_relative": "data/binkit_functions_filtered.json",
+  "prepare_two_stage": {
+    "seed": 42,
+    "min_queries": 1000,
+    "min_pcode_len": 16,
+    "output_dir_relative": "benchmarks/dev_binkit/split"
+  },
+  "eval_artifacts_dir_relative": "benchmarks/dev_binkit/artifacts",
+  "notes": "变更 seed/min_queries 或索引输入即新基准，须在 PR 中说明并更新 split/ 下 JSON。"
+}

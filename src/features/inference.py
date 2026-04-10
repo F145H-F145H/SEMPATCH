@@ -54,6 +54,8 @@ def run_with_cuda_oom_fallback(
     """在 CUDA OOM 时清空缓存并重试 CPU（精排等大批量场景）。"""
     import torch
 
+    from exceptions import EmbeddingError
+
     try:
         return compute_fn(chosen_device)
     except RuntimeError as e:
@@ -66,7 +68,12 @@ def run_with_cuda_oom_fallback(
         logger.warning("CUDA OOM%s，回退 CPU", f" ({context})" if context else "")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return compute_fn(torch.device("cpu"))
+        try:
+            return compute_fn(torch.device("cpu"))
+        except RuntimeError as cpu_e:
+            raise EmbeddingError(
+                f"CUDA OOM 后 CPU 回退也失败{' (' + context + ')' if context else ''}: {cpu_e}"
+            ) from cpu_e
 
 
 def _collect_vocab_from_features(features: Dict[str, Any]) -> Dict[str, int]:

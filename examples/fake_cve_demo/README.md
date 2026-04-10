@@ -2,7 +2,7 @@
 
 本目录提供 **10 个独立 ELF**（各含全局符号 `vuln_fake_01` … `vuln_fake_10`）、**`fake_cve_labeled.c`**（同源命名空间说明）与 **`manifest.json`**，用于走与生产一致的建库与查询管线，验收「输入查询二进制 → 报告中出现库内绑定的伪 CVE」。
 
-**无 Ghidra 自动化验收**（编造 JSON 漏洞库）：在项目根执行 `pytest -m fake_cve`（见 `tests/fixtures/fake_cve/` 与 `tests/test_fake_cve_match.py`）。
+**无 Ghidra 自动化验收**（编造 JSON 漏洞库）：在项目根执行 `pytest -m fake_cve` 或 `make eval-smoke`（见 `benchmarks/smoke/fake_cve/` 与 `tests/test_fake_cve_match.py`）。
 
 更通用的 CVE Demo 契约见 [docs/DEMO.md](../../docs/DEMO.md)。
 

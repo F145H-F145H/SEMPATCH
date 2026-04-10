@@ -17,7 +17,9 @@ source .venv/bin/activate
 # Run tests
 pytest                          # all tests
 pytest -m "not ghidra"          # skip Ghidra-dependent tests
-pytest -m fake_cve              # fake CVE match pipeline tests
+pytest -m fake_cve              # fake CVE match pipeline tests (data: benchmarks/smoke/fake_cve)
+make eval-smoke                 # same as pytest -m fake_cve
+make eval-dev / make eval-real  # see benchmarks/README.md
 pytest tests/test_dag.py        # single test file
 
 # Lint/format (black line-length=100, isort profile=black, ruff select E/F/I/W/UP)

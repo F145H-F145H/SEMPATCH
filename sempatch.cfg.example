@@ -1,5 +1,25 @@
 # SemPatch Replain - Ghidra 下载 + 函数提取
 # 复制为 sempatch.cfg 并修改
+#
+# ── 环境变量覆写清单 ──────────────────────────────────────────────
+# 所有配置项均可通过环境变量覆写（优先级高于 cfg 文件）：
+#   SEMPATCH_OUTPUT_DIR        → [paths] output_dir
+#   SEMPATCH_DATA_DIR          → [paths] data_dir
+#   SEMPATCH_TWO_STAGE_REL     → [paths] two_stage_rel
+#   SEMPATCH_MATCH_RUN_SUBDIR  → [paths] match_run_subdir
+#   SEMPATCH_UNPACK_DIR        → [paths] unpack_output_dir
+#   SEMPATCH_BINARY_CACHE_DIR  → [paths] binary_cache_dir
+#   SEMPATCH_BINWALK_CMD       → [unpack] binwalk_cmd
+#   GHIDRA_HOME                → [ghidra] ghidra_home
+#   SEMPATCH_PARALLEL_WORKERS  → [parallel] parallel_workers
+#   SEMPATCH_MIN_PARALLEL_WORKERS → [parallel] min_parallel_workers
+#   SEMPATCH_DAG_GHIDRA_THREAD_SLOTS → [dag] ghidra_thread_slots
+#   SEMPATCH_DAG_MAX_WORKERS   → [dag] max_workers
+#   SEMPATCH_PIPELINE_STRATEGY → [dag] pipeline_strategy
+#   SEMPATCH_FEATURE_GRAPH     → [feature] graph_enabled
+#   SEMPATCH_FEATURE_SEQ       → [feature] seq_enabled
+#   SEMPATCH_FAISS_INDEX       → [matcher] faiss_index_type
+#   SEMPATCH_LOG_LEVEL         → [log] log_level
 
 [ghidra]
 # Ghidra 安装目录（相对项目根或绝对路径）

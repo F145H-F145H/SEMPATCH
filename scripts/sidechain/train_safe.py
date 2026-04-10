@@ -294,13 +294,8 @@ def main() -> None:
     args = parser.parse_args()
 
     seed = args.seed
-    torch.manual_seed(seed)
-    random.seed(seed)
-    try:
-        import numpy
-        numpy.random.seed(seed)
-    except ImportError:
-        pass
+    from experiment_meta import set_deterministic
+    set_deterministic(seed)
 
     default_save = os.path.join(PROJECT_ROOT, "output", "safe_best_model.pt")
     default_cache = os.path.join(PROJECT_ROOT, "data", "features_cache")
@@ -486,6 +481,10 @@ def main() -> None:
             log_batches_every=max(1, int(args.progress_log_every)),
         )
         safe_save_model(model, vocab, save_path, embed_dim=args.embed_dim, output_dim=args.output_dim)
+
+        # 写入实验 metadata
+        from experiment_meta import save_metadata
+        save_metadata(save_path, args)
 
         if args.skip_validation or args.synthetic:
             print(f"最佳模型已保存至 {save_path}（已跳过校验）")

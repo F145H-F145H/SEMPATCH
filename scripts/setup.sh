@@ -117,6 +117,10 @@ setup_python_venv() {
     else
         log_warning "requirements.txt 不存在，跳过 pip install -r"
     fi
+    if [ -f "${PROJECT_ROOT}/requirements_frozen.txt" ]; then
+        pip install -r "${PROJECT_ROOT}/requirements_frozen.txt"
+        log_success "已安装 requirements_frozen.txt（精确版本锁）"
+    fi
     # 可选依赖（YAML 配置、ML 增强），--timeout 避免长时间无响应
     pip install pyyaml -q --timeout 60 2>/dev/null || true
     log_info "安装可选依赖 xgboost、imbalanced-learn（可跳过）..."

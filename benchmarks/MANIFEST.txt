@@ -1,0 +1,23 @@
+# benchmarks/MANIFEST.txt — 统一校验清单
+# 合并自 smoke/CHECKSUMS.sha256 + dev_binkit/CHECKSUMS.sha256 + real_cve/CHECKSUMS.sha256
+# 校验: sha256sum -c benchmarks/MANIFEST.txt（需从项目根执行）
+# 注意：三个独立 CHECKSUMS.sha256 文件保留（向后兼容 make check-benchmarks）
+
+# --- smoke ---
+75bc6917815365a08a0428f0d7d42ed7028a8e11af76f541db994219d9ac8c18  smoke/fake_cve/library_embeddings.json
+c31b56479744cf8d49a7fbf4c57780952916e80c849f4eb33d2a653b372d749e  smoke/fake_cve/library_features.json
+02a4a58035853eecb9ec5b991bdbd10e6e03b5d742c9e4fc0f539f14dfca662c  smoke/fake_cve/query_features.json
+ae007da96f8be92baf6f85b76d8a45b95503fea3a514c2dab9b3b01ab1508558  smoke/two_stage/ground_truth.json
+c31b56479744cf8d49a7fbf4c57780952916e80c849f4eb33d2a653b372d749e  smoke/two_stage/library_features.json
+6d16b8f3012e90cebdbf01ff76ef158d04e2f5313f5537106e940026e2112d16  smoke/two_stage/library_safe_embeddings.json
+02a4a58035853eecb9ec5b991bdbd10e6e03b5d742c9e4fc0f539f14dfca662c  smoke/two_stage/query_features.json
+
+# --- dev_binkit ---
+f1d198214902d8b07dd7d7d1f98e3544d82973044a430f6bfc9a4b16126ed87d  dev_binkit/split/ground_truth.json
+31e4ada3f379eacd14788010895286019eec8fabc28c0f204744b0a35bbaefdc  dev_binkit/split/library_features.json
+6230546ff3e44142d4f1b5df690844a25d5835f61b6246610996f1fa956642d1  dev_binkit/split/library_safe_embeddings.json
+039a0f0741141d8489f1340ccc6f1ccdeffb5fd03e05cdcc23a5c3ec79c2df87  dev_binkit/split/query_features.json
+
+# --- real_cve ---
+6a880e12a95be98d120387c2d218b907f1113c395352d3410ad483e449795a04  real_cve/example_data/query_embeddings.json
+bc08a1592634128945b49b800d22b4d29d2db64e8193d8b6663713006601d133  real_cve/example_data/library_embeddings.json

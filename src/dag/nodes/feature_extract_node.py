@@ -1,8 +1,11 @@
 """特征提取节点：从 LSIR 提取图/序列特征。"""
 
+import logging
 from typing import Any, Dict
 
 from ..model import DAGNode
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureExtractNode(DAGNode):
@@ -28,11 +31,14 @@ class FeatureExtractNode(DAGNode):
         funcs = lsir.get("functions", [])
         features_list = []
         for fn in funcs:
-            gf = extract_graph_features(fn)
-            sf = extract_sequence_features(fn)
-            acfg = extract_acfg_features(fn)
-            fused = fuse_features(gf, sf, acfg_feats=acfg, include_dfg=True)
-            features_list.append({"name": fn.get("name"), "features": fused})
+            try:
+                gf = extract_graph_features(fn)
+                sf = extract_sequence_features(fn)
+                acfg = extract_acfg_features(fn)
+                fused = fuse_features(gf, sf, acfg_feats=acfg, include_dfg=True)
+                features_list.append({"name": fn.get("name"), "features": fused})
+            except Exception as e:
+                logger.warning("跳过函数 %s: %s", fn.get("name", "?"), e)
         result = {"functions": features_list}
         self.output = result
         ctx[output_key] = result
