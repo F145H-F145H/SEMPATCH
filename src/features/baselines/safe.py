@@ -4,6 +4,7 @@ SAFE 风格基线：轻量序列编码器（token embedding + 聚合），用于
 SAFE 原文：汇编指令 → Instruction2Vec → 自注意力 RNN 聚合 → 函数嵌入。
 本实现采用 P-code token embedding + mean 聚合，输入与 embed_batch 兼容的 FeaturesDict。
 """
+
 from __future__ import annotations
 
 import json
@@ -13,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 try:
     import torch
     import torch.nn as nn
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -132,7 +134,9 @@ class _SafeEncoder(nn.Module if TORCH_AVAILABLE else object):
         self.embed = nn.Embedding(max(vocab_size, 16), embed_dim, padding_idx=0)
         self.proj = nn.Linear(embed_dim, output_dim)
 
-    def forward(self, token_ids: "torch.Tensor", pad_mask: "torch.Tensor | None" = None) -> "torch.Tensor":
+    def forward(
+        self, token_ids: "torch.Tensor", pad_mask: "torch.Tensor | None" = None
+    ) -> "torch.Tensor":
         x = self.embed(token_ids)
         if pad_mask is not None:
             x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
@@ -214,6 +218,11 @@ class SafeEmbedder:
             self._vocab = vocab
         else:
             # 未提供 model_path 时，调用方应避免在热路径中使用（因为 vocab 难以一致）
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "SafeEmbedder: model_path 未提供或文件不存在，embed_many 将返回零向量"
+            )
             self._model = None
             self._vocab = {"[PAD]": 0, "[UNK]": 1}
 
@@ -242,9 +251,7 @@ class SafeEmbedder:
         with torch.no_grad():
             for i in range(0, len(multimodals), batch_size):
                 chunk = multimodals[i : i + batch_size]
-                token_t, pad_mask_t = safe_tokenize_many(
-                    chunk, self._vocab, max_len=self._max_len
-                )
+                token_t, pad_mask_t = safe_tokenize_many(chunk, self._vocab, max_len=self._max_len)
                 token_t = token_t.to(self._device)
                 pad_mask_t = pad_mask_t.to(self._device)
                 vec = self._model(token_t, pad_mask_t)

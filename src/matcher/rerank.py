@@ -162,9 +162,14 @@ class RerankModel:
                 logger.debug("精排 load_state_dict unexpected keys: %s", list(unexpected)[:8])
         self._model.eval()
 
-    def _tensorize_many(
-        self, multimodals: Sequence[dict]
-    ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    def _tensorize_many(self, multimodals: Sequence[dict]) -> Tuple[
+        "torch.Tensor",
+        "torch.Tensor",
+        "torch.Tensor",
+        "torch.Tensor",
+        "torch.Tensor",
+        "torch.Tensor",
+    ]:
         """
         批量 tensorize：返回 (token_ids, jump_mask, node_ids, padding_mask, dfg_node_ids, dfg_edge_index)。
         CFG/DFG 的 edge_index 当前 GNN 实现中未用消息传递，传空或占位。
@@ -189,7 +194,9 @@ class RerankModel:
             llen = len(t)
             if llen > 0:
                 token_ids[i, :llen] = torch.tensor(t, dtype=torch.long, device=self._device)
-                jump_mask[i, :llen] = torch.tensor(j + [0] * max(0, llen - len(j)), dtype=torch.long, device=self._device)
+                jump_mask[i, :llen] = torch.tensor(
+                    j + [0] * max(0, llen - len(j)), dtype=torch.long, device=self._device
+                )
                 pad_mask[i, :llen] = False
 
             graph = (mm or {}).get("graph") or {}
@@ -199,7 +206,9 @@ class RerankModel:
                 opcodes = nf if isinstance(nf, list) else (nf.get("pcode_opcodes") or [])
                 nf_ids.append(self._vocab.get(opcodes[0], 1) if opcodes else 0)
             if nf_ids:
-                node_ids[i, : len(nf_ids)] = torch.tensor(nf_ids, dtype=torch.long, device=self._device)
+                node_ids[i, : len(nf_ids)] = torch.tensor(
+                    nf_ids, dtype=torch.long, device=self._device
+                )
 
             dfg = (mm or {}).get("dfg") or {}
             dfg_nf = dfg.get("node_features") or []
@@ -230,8 +239,13 @@ class RerankModel:
                 tt, jt, nt, pm, dnt, det = self._tensorize_many(chunk)
                 edge_t = torch.zeros((2, 0), dtype=torch.long, device=self._device)
                 vec = self._model(
-                    tt, jt, nt, edge_t, padding_mask=pm,
-                    dfg_node_features=dnt, dfg_edge_index=det,
+                    tt,
+                    jt,
+                    nt,
+                    edge_t,
+                    padding_mask=pm,
+                    dfg_node_features=dnt,
+                    dfg_edge_index=det,
                 )
                 if vec.dim() == 1:
                     vec = vec.unsqueeze(0)
@@ -279,6 +293,9 @@ def compute_rerank_scores(
     use_dfg_model: Optional[bool] = None,
 ) -> List[Tuple[str, float]]:
     """
+    .. deprecated:: 0.2
+        请使用 :class:`RerankModel` 的 :meth:`~RerankModel.score` 方法代替。
+
     批量精排：对每个候选计算与查询的余弦相似度得分。
 
     query_features: 单查询的 multimodal 特征 {graph, sequence}
@@ -287,6 +304,13 @@ def compute_rerank_scores(
 
     返回: [(candidate_id, score), ...]，按 score 降序排列。
     """
+    import warnings
+
+    warnings.warn(
+        "compute_rerank_scores 已弃用，请使用 RerankModel.score()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not candidate_features_list:
         return []
 
@@ -343,12 +367,21 @@ def compute_rerank_scores(
         with torch.no_grad():
             try:
                 qt, qj, qn, qe, qp, qdn, qde = _tensorize_multimodal(
-                    query_features, vocab, device=dev,
-                    max_seq_len=max_seq, max_graph_nodes=max_gn, max_dfg_nodes=max_dn,
+                    query_features,
+                    vocab,
+                    device=dev,
+                    max_seq_len=max_seq,
+                    max_graph_nodes=max_gn,
+                    max_dfg_nodes=max_dn,
                 )
                 query_vec = model(
-                    qt, qj, qn, qe, padding_mask=qp,
-                    dfg_node_features=qdn, dfg_edge_index=qde,
+                    qt,
+                    qj,
+                    qn,
+                    qe,
+                    padding_mask=qp,
+                    dfg_node_features=qdn,
+                    dfg_edge_index=qde,
                 )
                 query_list = query_vec.detach().cpu().numpy().tolist()
             except Exception as e:
@@ -358,12 +391,21 @@ def compute_rerank_scores(
             for cid, cand_mm in candidate_features_list:
                 try:
                     ct, cj, cn, ce, cp, cdn, cde = _tensorize_multimodal(
-                        cand_mm, vocab, device=dev,
-                        max_seq_len=max_seq, max_graph_nodes=max_gn, max_dfg_nodes=max_dn,
+                        cand_mm,
+                        vocab,
+                        device=dev,
+                        max_seq_len=max_seq,
+                        max_graph_nodes=max_gn,
+                        max_dfg_nodes=max_dn,
                     )
                     cand_vec = model(
-                        ct, cj, cn, ce, padding_mask=cp,
-                        dfg_node_features=cdn, dfg_edge_index=cde,
+                        ct,
+                        cj,
+                        cn,
+                        ce,
+                        padding_mask=cp,
+                        dfg_node_features=cdn,
+                        dfg_edge_index=cde,
                     )
                     cand_list = cand_vec.detach().cpu().numpy().tolist()
                     score = cosine_similarity(query_list, cand_list)

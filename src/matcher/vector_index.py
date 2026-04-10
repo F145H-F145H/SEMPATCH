@@ -4,6 +4,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 try:
     import faiss
+
     HAS_FAISS = True
 except ImportError:
     HAS_FAISS = False
@@ -32,24 +33,37 @@ class VectorIndex:
             return
         if HAS_FAISS and self._index is not None:
             import numpy as np
+
             m = np.array(vectors, dtype="float32")
             self._index.add(m)
             self._ids.extend(ids or [str(i) for i in range(len(vectors))])
         else:
             self._data.extend(vectors)
 
-    def search(
-        self, query: List[float], k: int = 10
-    ) -> List[tuple]:
+    def search(self, query: List[float], k: int = 10) -> List[tuple]:
         """搜索最近邻，返回 (id, score) 列表。"""
         if HAS_FAISS and self._index is not None:
             import numpy as np
+
             q = np.array([query], dtype="float32")
             scores, indices = self._index.search(q, min(k, self._index.ntotal))
             result = []
             for i, idx in enumerate(indices[0]):
                 if idx >= 0 and idx < len(self._ids):
                     result.append((self._ids[idx], float(scores[0][i])))
+            return result
+        # 无 FAISS：线性扫描降级
+        if hasattr(self, "_data") and self._data:
+            from .similarity import cosine_similarity
+
+            scored = [(i, cosine_similarity(query, v)) for i, v in enumerate(self._data)]
+            scored.sort(key=lambda x: -x[1])
+            result = []
+            for idx, score in scored[:k]:
+                if idx < len(self._ids):
+                    result.append((self._ids[idx], score))
+                else:
+                    result.append((str(idx), score))
             return result
         return []
 
@@ -92,6 +106,7 @@ def search_neighbors(
         return []
     try:
         from .similarity import cosine_similarity
+
         scores = [cosine_similarity(query_vec, v) for v in db_vectors]
         paired = [(i, s) for i, s in enumerate(scores)]
         paired.sort(key=lambda x: -x[1])

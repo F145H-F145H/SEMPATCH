@@ -39,7 +39,7 @@ COPY scripts/ scripts/
 COPY tests/ tests/
 COPY benchmarks/ benchmarks/
 COPY docs/ docs/
-COPY Makefile sempatch.cfg.example ./
+COPY Makefile sempatch.cfg.example sempatch.py sempatch sempatch_argv.py ./
 
 # 初始化配置
 RUN cp sempatch.cfg.example sempatch.cfg \

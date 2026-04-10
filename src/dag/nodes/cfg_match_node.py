@@ -33,7 +33,7 @@ def _cfg_to_graph(cfg: Any) -> Any:
 def _structural_similarity(g1: Any, g2: Any) -> float:
     """
     计算两 CFG 的结构相似度。
-    使用边集 Jaccard 的规范化形式，节点映射为拓扑序。
+    使用度序列签名 + 归一化规模比率的加权近似。
     """
     if not nx or g1 is None or g2 is None:
         return 0.0
@@ -58,10 +58,16 @@ def _structural_similarity(g1: Any, g2: Any) -> float:
     match = sum(1 for a, b in zip(s1, s2) if a == b)
     deg_sim = match / len_max if len_max else 1.0
 
-    # 规模相似度
-    size_sim = min(n1, n2, e1, e2) / max(n1, n2, 1) * 0.5 + min(e1, e2) / max(e1, e2, 1) * 0.5
+    # 规模相似度（节点与边分别归一化后加权）
+    if n1 == 0 and n2 == 0:
+        node_sim = 1.0
+    else:
+        node_sim = min(n1, n2) / max(n1, n2, 1)
     if e1 == 0 and e2 == 0:
-        size_sim = 1.0
+        edge_sim = 1.0
+    else:
+        edge_sim = min(e1, e2) / max(e1, e2, 1)
+    size_sim = node_sim * 0.5 + edge_sim * 0.5
 
     # mcs_ratio 近似：度结构相似度与规模相似度的加权
     mcs_ratio = 0.6 * deg_sim + 0.4 * min(1.0, size_sim)
@@ -97,13 +103,15 @@ class CFGMatchNode(DAGNode):
                     continue
                 mcs_ratio = _structural_similarity(fw_cfg, db_cfg)
                 if mcs_ratio >= threshold:
-                    matches.append({
-                        "firmware_func": fw.get("name", ""),
-                        "db_func": db.get("name", ""),
-                        "similarity": mcs_ratio,
-                        "method": "cfg_mcs",
-                        "mcs_ratio": mcs_ratio,
-                    })
+                    matches.append(
+                        {
+                            "firmware_func": fw.get("name", ""),
+                            "db_func": db.get("name", ""),
+                            "similarity": mcs_ratio,
+                            "method": "cfg_mcs",
+                            "mcs_ratio": mcs_ratio,
+                        }
+                    )
 
         result = {"matches": matches}
         self.output = result

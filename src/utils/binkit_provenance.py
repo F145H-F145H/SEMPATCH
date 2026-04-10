@@ -32,11 +32,22 @@ _ARCH_PATH_ALIASES: Tuple[Tuple[str, str], ...] = (
 
 # basename 中的编译器 / 优化标记
 _CC_RE = re.compile(r"(?P<cc>gcc|clang)(?:[\W_]|$)", re.IGNORECASE)
-_OPT_RE = re.compile(r"(?:^|[._-])(?P<opt>O[0-3]|Os|Ofast)(?:[._-]|$)", re.IGNORECASE)
+_OPT_RE = re.compile(r"(?:^|[._\-])(?P<opt>O[0-3]|Os|Ofast)(?:[._\-]|$)", re.IGNORECASE)
+
+# BinKit 命名格式：{project}_{compiler-ver}_{arch}_{opt}_{binary}
+# 例：coreutils-9.1_gcc-10.3.0_x86_64_Ofast_fmt
+# project 可能含 -X.Y 版本号（如 gawk-5.2.1），compiler-ver 为 gcc-N.N.N 或 clang-N.N
+# 用 compiler-ver 的起始位置做切分：匹配 _gcc-\d 或 _clang-\d 后面跟 .或数字
+_BINKIT_PROJECT_RE = re.compile(
+    r"^(?P<project>.+?)_(?:gcc|clang)-\d[\d.]*(?:_\w+)*(?:_\w+)?(?:\.\S+)?$",
+    re.IGNORECASE,
+)
 
 # 从 project_id 尾部剥编译产物后缀：_O2_gcc / -O3-clang / _Os 等
+# 同时处理 _gcc-10.3.0 / _clang-8.0 等带版本号的编译器标记
 _PROJECT_STRIP_RE = re.compile(
-    r"([._-](?:O[0-3]|Os|Ofast))(?:[._-](?:gcc|clang))?$|([._-](?:gcc|clang))$",
+    r"([._-](?:O[0-3]|Os|Ofast))(?:[._-](?:gcc|clang)(?:-[\d.]+)?)?$"
+    r"|(?:[._-](?:gcc|clang)(?:-[\d.]+)?)$",
     re.IGNORECASE,
 )
 
@@ -89,8 +100,17 @@ def _detect_opt(basename_stem: str) -> str:
 def derive_project_id(binary_rel: str) -> str:
     """
     同源弱键：basename 去掉扩展名后再去掉尾部 _O? / _gcc / _clang 等片段。
+
+    BinKit 特殊处理：文件名格式 {project}_{compiler-ver}_{arch}_{opt}_{binary}，
+    先用 _BINKIT_PROJECT_RE 提取 project 段，避免把 compiler-version 吃进 project_id。
+    例：coreutils-9.1_gcc-10.3.0_x86_64_Ofast_fmt → coreutils-9.1
     """
     stem = _basename_stem(binary_rel)
+    # 优先尝试 BinKit 命名格式
+    m = _BINKIT_PROJECT_RE.match(stem)
+    if m:
+        return m.group("project").strip("._-") or stem
+    # 回退：逐次剥离尾部 compiler/opt 标记
     s = stem
     prev = None
     while prev != s:
@@ -99,18 +119,31 @@ def derive_project_id(binary_rel: str) -> str:
     return s.strip("._-") or stem
 
 
+def _full_basename(binary_rel: str) -> str:
+    """返回完整 basename（不做 .ext 截断），供 BinKit 全名解析用。"""
+    base = os.path.basename((binary_rel or "").replace("\\", "/"))
+    return base or "unknown"
+
+
 def parse_binary_provenance(binary_rel: str) -> Tuple[str, VariantHints]:
     """
     解析单条索引中的 binary 相对路径。
+
+    BinKit 格式 {project}_{compiler-ver}_{arch}_{opt}_{binary} 中 basename 含多个 .，
+    _basename_stem 的 rsplit 会截断版本号（如 clang-8.0 → clang-8）。
+    因此 arch/opt/compiler 检测使用 _full_basename，project_id 使用 _basename_stem + BinKit 专用正则。
 
     Returns:
         (project_id, variant_hints)
     """
     norm = (binary_rel or "").replace("\\", "/")
+    full_base = _full_basename(norm)
     stem = _basename_stem(norm)
+    # arch 从路径段检测（不受 basename 截断影响）
     arch = _detect_arch_from_path(norm)
-    compiler = _detect_compiler(stem)
-    opt = _detect_opt(stem)
+    # compiler/opt 从完整 basename 检测，避免版本号 . 截断
+    compiler = _detect_compiler(full_base)
+    opt = _detect_opt(full_base)
     hints = VariantHints(arch=arch, compiler=compiler, opt=opt)
     return derive_project_id(norm), hints
 

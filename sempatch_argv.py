@@ -1,5 +1,7 @@
 """
-./sempatch 入口参数改写：供根目录 `sempatch` 与单元测试共用。
+./sempatch 入口参数改写：供根目录 `sempatch` 脚本与单元测试共用。
+
+此模块被 ``sempatch`` 包装脚本导入使用（非废弃代码）。
 
 - 已知子命令 compare / extract / match / unpack 原样传递。
 - 「ELF + 两阶段库目录」双位置参数 → match --query-binary … --two-stage-dir …
@@ -33,8 +35,14 @@ def rewrite_sempatch_argv(argv: List[str]) -> List[str]:
     if len(argv) >= 2:
         bin_path = argv[0]
         lib_dir = os.path.expanduser(argv[1])
-        if os.path.isfile(bin_path) and os.path.isdir(lib_dir) and looks_like_two_stage_lib_dir(lib_dir):
-            return ["match", "--query-binary", bin_path, "--two-stage-dir", lib_dir] + list(argv[2:])
+        if (
+            os.path.isfile(bin_path)
+            and os.path.isdir(lib_dir)
+            and looks_like_two_stage_lib_dir(lib_dir)
+        ):
+            return ["match", "--query-binary", bin_path, "--two-stage-dir", lib_dir] + list(
+                argv[2:]
+            )
     if argv[0].startswith("-"):
         return list(argv)
     return ["extract"] + list(argv)

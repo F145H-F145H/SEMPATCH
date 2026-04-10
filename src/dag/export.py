@@ -1,8 +1,20 @@
 """DAG 导出：Mermaid、DOT、HTML。"""
 
-from typing import Optional
+import logging
+import re
+from typing import Dict, Optional
 
 from .model import DAGNode, JobDAG
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_id(nid: str) -> str:
+    """将 node_id 转为 Mermaid/DOT 合法标识符。"""
+    safe = re.sub(r"[^a-zA-Z0-9_]", "_", nid)
+    if safe and safe[0].isdigit():
+        safe = "_" + safe
+    return safe
 
 
 def _node_style(node: DAGNode) -> str:
@@ -15,19 +27,30 @@ def _node_style(node: DAGNode) -> str:
 
 def export_mermaid(dag: JobDAG, path: Optional[str] = None) -> str:
     """导出 Mermaid 格式。"""
+    id_map: Dict[str, str] = {}
+    collision_check: Dict[str, str] = {}
+    for nid in dag.nodes:
+        safe = _sanitize_id(nid)
+        if safe in collision_check and collision_check[safe] != nid:
+            logger.warning(
+                "Mermaid 导出 ID 碰撞: %s 和 %s 均映射为 %s", collision_check[safe], nid, safe
+            )
+        collision_check[safe] = nid
+        id_map[nid] = safe
+
     lines = ["flowchart TB"]
     for nid, node in dag.nodes.items():
-        safe = nid.replace("-", "_")
+        safe = id_map[nid]
         label = node.display_label(nid)
         lines.append(f'    {safe}["{label}"]')
     for nid, node in dag.nodes.items():
-        safe = nid.replace("-", "_")
+        safe = id_map[nid]
         style = _node_style(node)
         lines.append(f"    style {safe} {style}")
     for nid, node in dag.nodes.items():
-        src = nid.replace("-", "_")
+        src = id_map[nid]
         for d in node.deps:
-            dst = d.replace("-", "_")
+            dst = id_map.get(d, _sanitize_id(d))
             lines.append(f"    {dst} --> {src}")
     text = "\n".join(lines)
     if path:
@@ -38,16 +61,20 @@ def export_mermaid(dag: JobDAG, path: Optional[str] = None) -> str:
 
 def export_dot(dag: JobDAG, path: Optional[str] = None) -> str:
     """导出 DOT 格式。"""
+    id_map: Dict[str, str] = {}
+    for nid in dag.nodes:
+        id_map[nid] = _sanitize_id(nid)
+
     lines = ["digraph G {", "  rankdir=TB;"]
     for nid, node in dag.nodes.items():
         label = node.display_label(nid)
         color = "red" if node.failed else ("green" if node.done else "yellow")
-        nid_safe = nid.replace("-", "_")
+        nid_safe = id_map[nid]
         lines.append(f'  {nid_safe} [label="{label}", style=filled, fillcolor={color}];')
     for nid, node in dag.nodes.items():
-        src = nid.replace("-", "_")
+        src = id_map[nid]
         for d in node.deps:
-            dst = d.replace("-", "_")
+            dst = id_map.get(d, _sanitize_id(d))
             lines.append(f"  {dst} -> {src};")
     lines.append("}")
     text = "\n".join(lines)

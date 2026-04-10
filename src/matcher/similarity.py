@@ -1,6 +1,6 @@
 """相似度计算函数。"""
 
-from typing import List, Union
+from typing import List, Sequence, Union
 
 
 def cosine_similarity(a: List[Union[int, float]], b: List[Union[int, float]]) -> float:
@@ -13,6 +13,20 @@ def cosine_similarity(a: List[Union[int, float]], b: List[Union[int, float]]) ->
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
+
+
+def cosine_similarity_batch(
+    queries: Sequence[Sequence[float]],
+    db_vectors: Sequence[Sequence[float]],
+) -> "list":
+    """批量余弦相似度（numpy 向量化）。返回 shape=(len(queries), len(db_vectors)) 的矩阵。"""
+    import numpy as np
+
+    q = np.array(queries, dtype=np.float32)
+    d = np.array(db_vectors, dtype=np.float32)
+    q_norm = q / np.linalg.norm(q, axis=1, keepdims=True).clip(min=1e-10)
+    d_norm = d / np.linalg.norm(d, axis=1, keepdims=True).clip(min=1e-10)
+    return (q_norm @ d_norm.T).tolist()
 
 
 def euclidean_distance(a: List[Union[int, float]], b: List[Union[int, float]]) -> float:

@@ -14,6 +14,7 @@ class DiffNode(DAGNode):
         firmware_key = self.params.get("firmware_embeddings_key", "embeddings")
         db_key = self.params.get("db_embeddings_key", "db_embeddings")
         output_key = self.params.get("output_key", "diff_result")
+        threshold = float(self.params.get("threshold", 0.0))
 
         fw_emb = ctx.get(firmware_key)
         db_emb = ctx.get(db_key)
@@ -42,11 +43,15 @@ class DiffNode(DAGNode):
                     sim = cosine_similarity(vec, dv)
                 else:
                     sim = 0.0
-                matches.append({
-                    "firmware_func": fe.get("name"),
-                    "db_func": de.get("name"),
-                    "similarity": sim,
-                })
+                if sim < threshold:
+                    continue
+                matches.append(
+                    {
+                        "firmware_func": fe.get("name"),
+                        "db_func": de.get("name"),
+                        "similarity": sim,
+                    }
+                )
         result = {"matches": matches}
         self.output = result
         ctx[output_key] = result

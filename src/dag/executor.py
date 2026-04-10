@@ -30,25 +30,12 @@ def run_dag(
     lock = threading.Lock()
     max_workers = max(1, min(64, DAG_MAX_WORKERS))
 
-    import multiprocessing
+    from .nodes import NODE_TYPE_REGISTRY
 
-    sem_ghidra = multiprocessing.Semaphore(DAG_GHIDRA_THREAD_SLOTS)
-    sem_cpu = multiprocessing.Semaphore(max(1, DAG_MAX_WORKERS))
-    sem_by_type: Dict[str, Any] = {
-        "ghidra": sem_ghidra,
-        "lsir_build": sem_cpu,
-        "feature_extract": sem_cpu,
-        "embed": sem_cpu,
-        "load_db": sem_cpu,
-        "diff": sem_cpu,
-        "unpack": sem_cpu,
-        "fuzzy_hash": sem_cpu,
-        "cfg_match": sem_cpu,
-        "acfg_extract": sem_cpu,
-        "diff_faiss": sem_cpu,
-        "diff_bipartite": sem_cpu,
-        "diff_fuzzy": sem_cpu,
-    }
+    sem_ghidra = threading.Semaphore(DAG_GHIDRA_THREAD_SLOTS)
+    sem_cpu = threading.Semaphore(max(1, DAG_MAX_WORKERS))
+    sem_by_type: Dict[str, Any] = {nt: sem_cpu for nt in NODE_TYPE_REGISTRY}
+    sem_by_type["ghidra"] = sem_ghidra
 
     def get_ready() -> list:
         with lock:
@@ -84,10 +71,7 @@ def run_dag(
                         ready_queue.append(cnid)
             else:
                 node = dag.nodes[nid]
-                if (
-                    getattr(node, "retriable", False)
-                    and node.retry_count < node.max_retries
-                ):
+                if getattr(node, "retriable", False) and node.retry_count < node.max_retries:
                     node.retry_count += 1
                     node.failed = False
                     ready_queue.append(nid)

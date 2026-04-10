@@ -125,14 +125,12 @@ def embed_batch(
             infer_use_dfg_from_state_dict,
             parse_multimodal_checkpoint,
         )
+
         TORCH_AVAILABLE = True
     except ImportError:
         TORCH_AVAILABLE = False
 
-    has_multimodal = any(
-        (item.get("features") or {}).get("multimodal")
-        for item in funcs
-    )
+    has_multimodal = any((item.get("features") or {}).get("multimodal") for item in funcs)
     if not TORCH_AVAILABLE or not has_multimodal:
         return _embed_baseline(features)
 
@@ -191,7 +189,9 @@ def embed_batch(
 
 
 def _embed_baseline(features: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """无 PyTorch 或多模态时的基线：基于 pcode 序列或 ACFG 的简单哈希向量。"""
+    """无 PyTorch 或多模态时的基线：基于 pcode 序列或 ACFG 的确定性哈希向量。"""
+    import hashlib
+
     funcs = features.get("functions") or []
     out = []
     for item in funcs:
@@ -203,13 +203,20 @@ def _embed_baseline(features: Dict[str, Any]) -> List[Dict[str, Any]]:
             seq = mm.get("sequence") or {}
             tokens = seq.get("pcode_tokens") or []
             if not tokens:
-                nf = feats.get("node_features") or (feats.get("graph") or {}).get("node_features") or []
+                nf = (
+                    feats.get("node_features")
+                    or (feats.get("graph") or {}).get("node_features")
+                    or []
+                )
                 for n in nf:
                     opcodes = n if isinstance(n, list) else n.get("pcode_opcodes", []) or []
                     tokens.extend(opcodes)
-        h = hash(tuple(tokens)) & 0x7FFFFFFF
+        token_str = "|".join(str(t) for t in tokens)
+        digest = hashlib.md5(token_str.encode("utf-8")).digest()
         vec = [0.0] * 128
         for i in range(128):
-            vec[i] = ((h >> (i % 24)) & 1) * 1.0 - 0.5
+            byte_idx = i // 8
+            bit_idx = i % 8
+            vec[i] = ((digest[byte_idx] >> bit_idx) & 1) * 1.0 - 0.5
         out.append({"name": name, "vector": vec})
     return out

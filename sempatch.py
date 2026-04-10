@@ -27,9 +27,7 @@ def run_unpack(firmware_path: str, output_dir: str) -> dict:
     os.makedirs(output_dir, exist_ok=True)
 
     dag = JobDAG()
-    build_unpack_node(
-        dag, "unpack_fw", firmware_path, output_dir=output_dir, deps=[]
-    )
+    build_unpack_node(dag, "unpack_fw", firmware_path, output_dir=output_dir, deps=[])
 
     ctx = {}
     run_dag(dag, ctx)
@@ -60,17 +58,15 @@ def _build_compare_dag(
         build_lsir_build_node,
     )
 
-    build_ghidra_node(
-        dag, "ghidra_fw", binary_path, ghidra_out,
-        deps=[], force=force
-    )
+    build_ghidra_node(dag, "ghidra_fw", binary_path, ghidra_out, deps=[], force=force)
     build_lsir_build_node(dag, "lsir_fw", deps=["ghidra_fw"])
 
     if strategy == "traditional_fuzzy":
         build_fuzzy_hash_node(dag, "fuzzy_hash", deps=["lsir_fw"])
         build_load_db_node(dag, "load_db", db_path=db_path, deps=[], db_format="fuzzy_hashes")
         build_diff_fuzzy_node(
-            dag, "diff",
+            dag,
+            "diff",
             deps=["fuzzy_hash", "load_db"],
             fuzzy_hashes_key="fuzzy_hashes",
             db_fuzzy_hashes_key="db_fuzzy_hashes",
@@ -78,17 +74,21 @@ def _build_compare_dag(
     elif strategy == "traditional_cfg":
         build_load_db_node(dag, "load_db", db_path=db_path, deps=[], db_format="lsir")
         build_cfg_match_node(
-            dag, "diff",
+            dag,
+            "diff",
             deps=["lsir_fw", "load_db"],
             lsir_key="lsir",
             db_lsir_key="db_lsir",
         )
     elif strategy == "graph_embed":
         build_acfg_extract_node(dag, "acfg_fw", deps=["lsir_fw"])
-        build_embed_node(dag, "embed_fw", deps=["acfg_fw"], input_key="acfg_features", output_key="embeddings")
+        build_embed_node(
+            dag, "embed_fw", deps=["acfg_fw"], input_key="acfg_features", output_key="embeddings"
+        )
         build_load_db_node(dag, "load_db", db_path=db_path, deps=[])
         build_diff_faiss_node(
-            dag, "diff",
+            dag,
+            "diff",
             deps=["embed_fw", "load_db"],
             firmware_embeddings_key="embeddings",
             db_embeddings_key="db_embeddings",
@@ -104,16 +104,15 @@ def _build_compare_dag(
         build_embed_node(dag, "embed_fw", deps=["feat_fw"])
         build_load_db_node(dag, "load_db", db_path=db_path, deps=[])
         build_diff_bipartite_node(
-            dag, "diff",
+            dag,
+            "diff",
             deps=["embed_fw", "load_db"],
             firmware_embeddings_key="embeddings",
             db_embeddings_key="db_embeddings",
         )
 
 
-def run_firmware_vs_db(
-    binary_path: str, db_path: str, output_dir: str, **kwargs
-) -> dict:
+def run_firmware_vs_db(binary_path: str, db_path: str, output_dir: str, **kwargs) -> dict:
     """
     固件 vs 漏洞库 模式：构建 DAG、执行、返回 ctx。
     按 pipeline_strategy 选择流水线。
@@ -132,13 +131,17 @@ def run_firmware_vs_db(
 
     try:
         from config import PIPELINE_STRATEGY
+
         strategy = kwargs.get("strategy") or PIPELINE_STRATEGY
     except ImportError:
         strategy = kwargs.get("strategy", "semantic_embed")
 
     dag = JobDAG()
     _build_compare_dag(
-        dag, binary_path, ghidra_out, db_path,
+        dag,
+        binary_path,
+        ghidra_out,
+        db_path,
         strategy=strategy,
         force=kwargs.get("force", False),
     )
@@ -179,10 +182,10 @@ def main():
 
     add_match_arguments(match_parser, require_source=True)
 
-    # compare: legacy DAG
+    # compare: legacy DAG [DEPRECATED]
     compare_parser = subparsers.add_parser(
         "compare",
-        help="[legacy] DAG：固件 vs 漏洞库嵌入/差分（非 TwoStage 产品路径）",
+        help="[DEPRECATED] DAG：固件 vs 漏洞库嵌入/差分（请使用 match）",
     )
     compare_parser.add_argument("firmware", help="固件二进制路径")
     compare_parser.add_argument("db_path", help="漏洞库路径")
@@ -203,15 +206,17 @@ def main():
     )
 
     # unpack: binwalk 解包固件
-    unpack_parser = subparsers.add_parser(
-        "unpack", help="使用 binwalk 解包固件镜像（DAG 节点）"
-    )
+    unpack_parser = subparsers.add_parser("unpack", help="使用 binwalk 解包固件镜像（DAG 节点）")
     unpack_parser.add_argument("firmware", help="固件镜像路径")
-    unpack_parser.add_argument(
-        "-o", "--output", default="output/unpacked", help="解包输出目录"
-    )
+    unpack_parser.add_argument("-o", "--output", default="output/unpacked", help="解包输出目录")
 
     # legacy: Ghidra 仅导出 lsir_raw
+    def _positive_int(value):
+        ivalue = int(value)
+        if ivalue <= 0:
+            raise argparse.ArgumentTypeError(f"timeout must be positive, got {ivalue}")
+        return ivalue
+
     legacy_parser = subparsers.add_parser(
         "extract",
         help="[legacy] Ghidra 提取 lsir_raw.json（CVE 匹配请用 match）",
@@ -219,7 +224,7 @@ def main():
     legacy_parser.add_argument("binary", help="二进制文件路径")
     legacy_parser.add_argument("-o", "--output", default="output/v1", help="输出目录")
     legacy_parser.add_argument("--force", action="store_true", help="强制重新提取")
-    legacy_parser.add_argument("--timeout", type=int, default=None, help="超时秒数")
+    legacy_parser.add_argument("--timeout", type=_positive_int, default=None, help="超时秒数")
 
     args = parser.parse_args()
 
@@ -231,6 +236,13 @@ def main():
             sys.exit(1)
 
     elif args.command == "compare":
+        import warnings
+
+        warnings.warn(
+            "compare 子命令已弃用，请使用 match 子命令",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         print(
             "提示: compare 为 legacy DAG；产品 CVE 匹配请使用: python sempatch.py match ...",
             file=sys.stderr,
@@ -304,6 +316,7 @@ def main():
             print("错误: extract 需要可用的 Ghidra 环境:", e, file=sys.stderr)
             sys.exit(1)
         from utils.ghidra_runner import run_ghidra_analysis
+
         output_dir = os.path.abspath(args.output)
         os.makedirs(output_dir, exist_ok=True)
         run_ghidra_analysis(

@@ -158,10 +158,15 @@ class _LibraryFeaturesLazy:
         扫描 JSON 文件，建立 top-level key → 字节偏移映射。
         文件格式假定为 {"key1": value1, "key2": value2, ...}，
         key 均为字符串，value 为任意 JSON 值。
+
+        使用 mmap 避免将整个文件读入进程内存。
         """
+        import mmap as _mmap
+
         self._index = {}
         self._fd = open(self._path, "rb")
-        buf = self._fd.read()
+        self._mm = _mmap.mmap(self._fd.fileno(), 0, access=_mmap.ACCESS_READ)
+        buf = self._mm
         n = len(buf)
 
         # 定位到第一个 '{'
@@ -255,9 +260,19 @@ class _LibraryFeaturesLazy:
         return self._index.keys() if self._index is not None else {}.keys()
 
     def close(self) -> None:
+        if hasattr(self, "_mm") and self._mm is not None:
+            self._mm.close()
+            self._mm = None
         if self._fd is not None:
             self._fd.close()
             self._fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def __del__(self) -> None:
         self.close()
@@ -346,13 +361,13 @@ class TwoStagePipeline:
             raise KeyError(f"查询 function_id 不存在: {query_func_id}")
         mm = self._query_features[query_func_id]
         return retrieve_coarse(
-            mm, self._faiss_index, k=self._coarse_k,
+            mm,
+            self._faiss_index,
+            k=self._coarse_k,
             safe_model_path=self._safe_model_path,
         )
 
-    def rerank(
-        self, query_func_id: str, candidate_ids: List[str]
-    ) -> List[Tuple[str, float]]:
+    def rerank(self, query_func_id: str, candidate_ids: List[str]) -> List[Tuple[str, float]]:
         """
         精排：加载 query 与 candidate 特征，返回按得分降序的 [(candidate_id, score), ...]。
         空候选返回空列表。
@@ -362,9 +377,7 @@ class TwoStagePipeline:
         if not candidate_ids:
             return []
         query_mm = self._query_features[query_func_id]
-        cand_features = load_candidate_features_from_dict(
-            candidate_ids, self._library_features
-        )
+        cand_features = load_candidate_features_from_dict(candidate_ids, self._library_features)
         return self._rerank_model.score(query_mm, cand_features)
 
     def retrieve_and_rerank(self, query_func_id: str) -> List[Tuple[str, float]]:
@@ -423,16 +436,14 @@ class TwoStagePipeline:
                     coarse_ids = coarse_ids[: min(rerank_k, len(coarse_ids))]
                 rerank_inputs.append((qid, q_mm, coarse_ids))
 
-            # 批量精排：按 query 分块
-            for i in range(0, len(rerank_inputs), 1):
+            # 逐 query 精排（每个 query 的候选集不同，rerank_batch_size 控制候选内批大小）
+            for i in range(len(rerank_inputs)):
                 qid, q_mm, cand_ids = rerank_inputs[i]
                 if not cand_ids:
                     n_total += 1
                     continue
                 cand_feats = load_candidate_features_from_dict(cand_ids, self._library_features)
-                ranked = self._rerank_model.score(
-                    q_mm, cand_feats, batch_size=rerank_batch_size
-                )
+                ranked = self._rerank_model.score(q_mm, cand_feats, batch_size=rerank_batch_size)
                 positives = set(ground_truth.get(qid) or [])
                 if ranked and ranked[0][0] in positives:
                     r1_hits += 1

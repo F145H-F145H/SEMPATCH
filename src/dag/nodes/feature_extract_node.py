@@ -3,6 +3,7 @@
 import logging
 from typing import Any, Dict
 
+from exceptions import FeatureExtractionError
 from ..model import DAGNode
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class FeatureExtractNode(DAGNode):
                 acfg = extract_acfg_features(fn)
                 fused = fuse_features(gf, sf, acfg_feats=acfg, include_dfg=True)
                 features_list.append({"name": fn.get("name"), "features": fused})
-            except Exception as e:
+            except (KeyError, ValueError, TypeError, FeatureExtractionError) as e:
                 logger.warning("跳过函数 %s: %s", fn.get("name", "?"), e)
         result = {"functions": features_list}
         self.output = result

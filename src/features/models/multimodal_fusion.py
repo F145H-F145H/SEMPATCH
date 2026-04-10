@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     import torch
     import torch.nn as nn
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -87,17 +88,17 @@ class MultiModalFusionModel(nn.Module if TORCH_AVAILABLE else object):
         _te_kw: Dict[str, Any] = {}
         if "enable_nested_tensor" in inspect.signature(nn.TransformerEncoder.__init__).parameters:
             _te_kw["enable_nested_tensor"] = False
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_transformer_layers, **_te_kw
-        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_transformer_layers, **_te_kw)
         self.seq_proj = nn.Linear(embed_dim, output_dim)
 
         # 图分支：简化的 GNN（消息传递）
         self.node_embed = nn.Embedding(512, embed_dim)  # 节点 id 或 pcode 聚合
-        self.gnn_layers = nn.ModuleList([
-            nn.Linear(embed_dim * 2, hidden_dim),
-            nn.Linear(hidden_dim, embed_dim),
-        ])
+        self.gnn_layers = nn.ModuleList(
+            [
+                nn.Linear(embed_dim * 2, hidden_dim),
+                nn.Linear(hidden_dim, embed_dim),
+            ]
+        )
         self.gnn_proj = nn.Linear(embed_dim, output_dim)
 
         if use_dfg:
@@ -140,7 +141,27 @@ class MultiModalFusionModel(nn.Module if TORCH_AVAILABLE else object):
         node_features: "torch.Tensor",
         edge_index: "torch.Tensor",
     ) -> "torch.Tensor":
-        h = self.node_embed(node_features)
+        h = self.node_embed(node_features)  # (B, N, E)
+        B, N, E = h.shape
+        if edge_index.shape[1] > 0:
+            src, dst = edge_index[0], edge_index[1]
+            agg = torch.zeros_like(h)
+            for b in range(B):
+                offset = b * N
+                mask = (src >= offset) & (src < offset + N)
+                s = src[mask] - offset
+                d = dst[mask] - offset
+                if s.numel() == 0:
+                    continue
+                agg[b].index_add_(0, d, h[b][s])
+                deg = torch.zeros(N, device=h.device)
+                deg.index_add_(0, d, torch.ones_like(s, dtype=torch.float))
+                deg = deg.clamp(min=1).unsqueeze(-1)
+                agg[b] = agg[b] / deg
+            h = torch.cat([h, agg], dim=-1)
+            h = self.gnn_layers[0](h)
+            h = torch.relu(h)
+            h = self.gnn_layers[1](h)
         h = h.mean(dim=1)
         return self.gnn_proj(h)
 
@@ -151,7 +172,24 @@ class MultiModalFusionModel(nn.Module if TORCH_AVAILABLE else object):
     ) -> "torch.Tensor":
         if not self.use_dfg or self.dfg_node_embed is None or self.dfg_gnn_proj is None:
             raise RuntimeError("DFG branch not enabled")
-        h = self.dfg_node_embed(node_features)
+        h = self.dfg_node_embed(node_features)  # (B, N, E)
+        B, N, E = h.shape
+        if edge_index.shape[1] > 0:
+            src, dst = edge_index[0], edge_index[1]
+            agg = torch.zeros_like(h)
+            for b in range(B):
+                offset = b * N
+                mask = (src >= offset) & (src < offset + N)
+                s = src[mask] - offset
+                d = dst[mask] - offset
+                if s.numel() == 0:
+                    continue
+                agg[b].index_add_(0, d, h[b][s])
+                deg = torch.zeros(N, device=h.device)
+                deg.index_add_(0, d, torch.ones_like(s, dtype=torch.float))
+                deg = deg.clamp(min=1).unsqueeze(-1)
+                agg[b] = agg[b] / deg
+            h = h + agg  # residual for DFG
         h = h.mean(dim=1)
         return self.dfg_gnn_proj(h)
 
@@ -201,8 +239,23 @@ def _tensorize_multimodal(
     max_seq_len: int = 512,
     max_graph_nodes: int = 128,
     max_dfg_nodes: int = 128,
-) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-    """将 multimodal 特征转为 tensor。返回 graph 与 dfg 的 node/edge 及序列张量。"""
+) -> Tuple[
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+]:
+    """将 multimodal 特征转为 tensor。
+
+    返回 7 元组，位置映射到 forward() 参数：
+        (token_t, jump_t, node_t, edge_t, pad_mask, dfg_node_t, dfg_edge_t)
+         ↓          ↓        ↓        ↓        ↓         ↓          ↓
+      token_ids  jump_mask graph_node_ edge_index padding_ dfg_node_ dfg_edge_
+                            features             mask     features   index
+    """
     if not TORCH_AVAILABLE:
         raise RuntimeError("PyTorch required")
     seq = multimodal.get("sequence") or {}
@@ -232,7 +285,11 @@ def _tensorize_multimodal(
         nf_flat = [0]
     node_t = torch.tensor([nf_flat], dtype=torch.long)
     edge_idx = graph.get("edge_index") or [[], []]
-    edge_t = torch.tensor(edge_idx, dtype=torch.long) if edge_idx[0] else torch.zeros(2, 0, dtype=torch.long)
+    edge_t = (
+        torch.tensor(edge_idx, dtype=torch.long)
+        if edge_idx[0]
+        else torch.zeros(2, 0, dtype=torch.long)
+    )
 
     dfg = multimodal.get("dfg") or {}
     dfg_nf = dfg.get("node_features") or []
@@ -246,7 +303,9 @@ def _tensorize_multimodal(
         dfg_ids = [0]
     dfg_node_t = torch.tensor([dfg_ids], dtype=torch.long)
     dfg_e = dfg.get("edge_index") or [[], []]
-    dfg_edge_t = torch.tensor(dfg_e, dtype=torch.long) if dfg_e[0] else torch.zeros(2, 0, dtype=torch.long)
+    dfg_edge_t = (
+        torch.tensor(dfg_e, dtype=torch.long) if dfg_e[0] else torch.zeros(2, 0, dtype=torch.long)
+    )
 
     if device:
         token_t = token_t.to(device)
@@ -262,11 +321,38 @@ def _tensorize_multimodal(
 def get_default_vocab() -> Dict[str, int]:
     """返回常见 P-code opcode 的默认 vocab。"""
     common_ops = [
-        "", "[UNK]",
-        "COPY", "LOAD", "STORE", "BRANCH", "CBRANCH", "BRANCHIND", "CALL", "CALLIND", "RETURN",
-        "INT_ADD", "INT_SUB", "INT_AND", "INT_OR", "INT_XOR", "INT_MULT", "INT_DIV",
-        "INT_EQUAL", "INT_NOTEQUAL", "INT_LESS", "INT_SLESS", "INT_NEGATE",
-        "INT_ZEXT", "INT_SEXT", "INT_2COMP", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT",
-        "INT_CARRY", "INT_SCARRY", "INT_SBORROW", "POPCOUNT",
+        "",
+        "[UNK]",
+        "COPY",
+        "LOAD",
+        "STORE",
+        "BRANCH",
+        "CBRANCH",
+        "BRANCHIND",
+        "CALL",
+        "CALLIND",
+        "RETURN",
+        "INT_ADD",
+        "INT_SUB",
+        "INT_AND",
+        "INT_OR",
+        "INT_XOR",
+        "INT_MULT",
+        "INT_DIV",
+        "INT_EQUAL",
+        "INT_NOTEQUAL",
+        "INT_LESS",
+        "INT_SLESS",
+        "INT_NEGATE",
+        "INT_ZEXT",
+        "INT_SEXT",
+        "INT_2COMP",
+        "INT_LEFT",
+        "INT_RIGHT",
+        "INT_SRIGHT",
+        "INT_CARRY",
+        "INT_SCARRY",
+        "INT_SBORROW",
+        "POPCOUNT",
     ]
     return {op: i for i, op in enumerate(common_ops)}

@@ -79,9 +79,10 @@ _match_run_subdir = (
 DEFAULT_MATCH_OUTPUT_DIR = os.path.join(OUTPUT_DIR, _match_run_subdir)
 DEFAULT_MATCH_OUTPUT_PATH = os.path.normpath(os.path.join(_output_dir_rel, _match_run_subdir))
 
-_unpack_output_rel = _cfg_get(
-    "paths", "unpack_output_dir", "SEMPATCH_UNPACK_DIR", "output/unpacked"
-).strip() or "output/unpacked"
+_unpack_output_rel = (
+    _cfg_get("paths", "unpack_output_dir", "SEMPATCH_UNPACK_DIR", "output/unpacked").strip()
+    or "output/unpacked"
+)
 UNPACK_OUTPUT_DIR = (
     os.path.join(PROJECT_ROOT, _unpack_output_rel)
     if not os.path.isabs(_unpack_output_rel)
@@ -112,25 +113,34 @@ else:
 ANALYZE_HEADLESS = os.path.join(GHIDRA_HOME, "support", "analyzeHeadless")
 
 # parallel
-_parallel_val = _cfg_get_int("parallel", "parallel_workers", "SEMPATCH_PARALLEL_WORKERS", 8)
+_parallel_val = _cfg_get_int("parallel", "parallel_workers", "SEMPATCH_PARALLEL_WORKERS", 4)
 PARALLEL_WORKERS = min(max(0, _parallel_val), 64)
 MIN_PARALLEL_WORKERS = _cfg_get_int(
     "parallel", "min_parallel_workers", "SEMPATCH_MIN_PARALLEL_WORKERS", 1
 )
 
 # dag
-DAG_GHIDRA_THREAD_SLOTS = _cfg_get_int("dag", "ghidra_thread_slots", "SEMPATCH_DAG_GHIDRA_THREAD_SLOTS", 2)
+DAG_GHIDRA_THREAD_SLOTS = _cfg_get_int(
+    "dag", "ghidra_thread_slots", "SEMPATCH_DAG_GHIDRA_THREAD_SLOTS", 2
+)
 DAG_MAX_WORKERS = _cfg_get_int("dag", "max_workers", "SEMPATCH_DAG_MAX_WORKERS", 4)
-PIPELINE_STRATEGY = _cfg_get(
-    "dag", "pipeline_strategy", "SEMPATCH_PIPELINE_STRATEGY", "semantic_embed"
-).strip().lower() or "semantic_embed"
+PIPELINE_STRATEGY = (
+    _cfg_get("dag", "pipeline_strategy", "SEMPATCH_PIPELINE_STRATEGY", "semantic_embed")
+    .strip()
+    .lower()
+    or "semantic_embed"
+)
 
 # ir (扩展)
 IR_DEFAULT_OPTS = _cfg_get("ir", "default_opts", None, "")
 
 # feature (扩展)
-FEATURE_GRAPH_ENABLED = _cfg_get("feature", "graph_enabled", "SEMPATCH_FEATURE_GRAPH", "true").lower() == "true"
-FEATURE_SEQ_ENABLED = _cfg_get("feature", "seq_enabled", "SEMPATCH_FEATURE_SEQ", "true").lower() == "true"
+FEATURE_GRAPH_ENABLED = (
+    _cfg_get("feature", "graph_enabled", "SEMPATCH_FEATURE_GRAPH", "true").lower() == "true"
+)
+FEATURE_SEQ_ENABLED = (
+    _cfg_get("feature", "seq_enabled", "SEMPATCH_FEATURE_SEQ", "true").lower() == "true"
+)
 
 # matcher (扩展)
 MATCHER_FAISS_INDEX_TYPE = _cfg_get("matcher", "faiss_index_type", "SEMPATCH_FAISS_INDEX", "flat")
