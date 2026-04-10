@@ -1,0 +1,29 @@
+# SemPatch 训练默认配置
+# 命令行参数覆盖同名项
+
+epochs: 20
+batch_size: 8
+lr: 0.0001
+num_pairs: 20000
+vocab_size: 256
+
+embed_dim: 64
+hidden_dim: 128
+num_gnn_layers: 2
+num_transformer_layers: 2
+output_dim: 128
+
+seed: 42
+num_workers: 4
+memory_cache_max_items: 512
+lsir_cache_max_binaries: 8
+max_seq_len: 8192
+max_graph_nodes: 512
+max_dfg_nodes: 128
+use_dfg: true
+progress_log_every: 20
+max_log_mb: 32
+log_backups: 5
+log_level: INFO
+max_tb_mb: 128
+tb_keep_runs: 5
