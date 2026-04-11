@@ -84,7 +84,8 @@ def _make_safe_step_fn(vocab, device, loss_fn, max_len=512, threshold=0.5):
 
         vec1_list = []
         vec2_list = []
-        for f1, f2 in zip(f1_list, f2_list):
+        success_indices = []
+        for idx, (f1, f2) in enumerate(zip(f1_list, f2_list)):
             try:
                 ids1, pad1 = safe_tokenize(f1, vocab, max_len=max_len)
                 ids2, pad2 = safe_tokenize(f2, vocab, max_len=max_len)
@@ -100,6 +101,7 @@ def _make_safe_step_fn(vocab, device, loss_fn, max_len=512, threshold=0.5):
                     v2 = v2.unsqueeze(0)
                 vec1_list.append(v1)
                 vec2_list.append(v2)
+                success_indices.append(idx)
             except Exception:
                 continue
 
@@ -110,7 +112,8 @@ def _make_safe_step_fn(vocab, device, loss_fn, max_len=512, threshold=0.5):
         vec1 = torch.cat(vec1_list, dim=0)
         vec2 = torch.cat(vec2_list, dim=0)
         n = vec1.size(0)
-        labels = labels[:n].to(device)
+        # 用成功样本的原始索引对齐 labels，而非截取前 n 个（避免因中间样本失败导致标签错位）
+        labels = labels[success_indices].to(device)
         loss = _loss_fn(vec1, vec2, labels)
         cos_sim = torch.nn.functional.cosine_similarity(vec1, vec2, dim=1)
         pred_sim = (cos_sim > threshold).float()
