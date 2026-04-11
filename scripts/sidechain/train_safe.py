@@ -85,20 +85,23 @@ def _make_safe_step_fn(vocab, device, loss_fn, max_len=512, threshold=0.5):
         vec1_list = []
         vec2_list = []
         for f1, f2 in zip(f1_list, f2_list):
-            ids1, pad1 = safe_tokenize(f1, vocab, max_len=max_len)
-            ids2, pad2 = safe_tokenize(f2, vocab, max_len=max_len)
-            t1 = torch.tensor([ids1], dtype=torch.long, device=device)
-            p1 = torch.tensor([pad1], dtype=torch.bool, device=device)
-            t2 = torch.tensor([ids2], dtype=torch.long, device=device)
-            p2 = torch.tensor([pad2], dtype=torch.bool, device=device)
-            v1 = model(t1, p1)
-            v2 = model(t2, p2)
-            if v1.dim() == 1:
-                v1 = v1.unsqueeze(0)
-            if v2.dim() == 1:
-                v2 = v2.unsqueeze(0)
-            vec1_list.append(v1)
-            vec2_list.append(v2)
+            try:
+                ids1, pad1 = safe_tokenize(f1, vocab, max_len=max_len)
+                ids2, pad2 = safe_tokenize(f2, vocab, max_len=max_len)
+                t1 = torch.tensor([ids1], dtype=torch.long, device=device)
+                p1 = torch.tensor([pad1], dtype=torch.bool, device=device)
+                t2 = torch.tensor([ids2], dtype=torch.long, device=device)
+                p2 = torch.tensor([pad2], dtype=torch.bool, device=device)
+                v1 = model(t1, p1)
+                v2 = model(t2, p2)
+                if v1.dim() == 1:
+                    v1 = v1.unsqueeze(0)
+                if v2.dim() == 1:
+                    v2 = v2.unsqueeze(0)
+                vec1_list.append(v1)
+                vec2_list.append(v2)
+            except Exception:
+                continue
 
         if not vec1_list:
             # 本 batch 全部样本 forward 失败，跳过（count=0）
@@ -395,14 +398,18 @@ def main() -> None:
     rerank_model_path = os.path.join(PROJECT_ROOT, "output", "best_model.pth")
 
     for retry in range(args.max_retries):
+        # 每次 retry 使用不同 seed，确保模型初始化权重不同
+        if retry > 0:
+            set_deterministic(seed + retry)
         log.info(
-            "开始本轮训练 retry=%s/%s num_pairs=%s epochs=%s batch_size=%s device=%s",
+            "开始本轮训练 retry=%s/%s num_pairs=%s epochs=%s batch_size=%s device=%s seed=%s",
             retry + 1,
             args.max_retries,
             num_pairs,
             epochs,
             args.batch_size,
             device,
+            seed + retry,
         )
         model = _SafeEncoder(
             vocab_size=vocab_size,

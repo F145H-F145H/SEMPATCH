@@ -92,7 +92,7 @@ class MultiModalFusionModel(nn.Module if TORCH_AVAILABLE else object):
         self.seq_proj = nn.Linear(embed_dim, output_dim)
 
         # 图分支：简化的 GNN（消息传递）
-        self.node_embed = nn.Embedding(512, embed_dim)  # 节点 id 或 pcode 聚合
+        self.node_embed = nn.Embedding(pcode_vocab_size, embed_dim)  # 节点 id 或 pcode 聚合
         self.gnn_layers = nn.ModuleList(
             [
                 nn.Linear(embed_dim * 2, hidden_dim),
@@ -102,7 +102,7 @@ class MultiModalFusionModel(nn.Module if TORCH_AVAILABLE else object):
         self.gnn_proj = nn.Linear(embed_dim, output_dim)
 
         if use_dfg:
-            self.dfg_node_embed = nn.Embedding(512, embed_dim, padding_idx=0)
+            self.dfg_node_embed = nn.Embedding(pcode_vocab_size, embed_dim, padding_idx=0)
             self.dfg_gnn_proj = nn.Linear(embed_dim, output_dim)
             self.graph_fuse = nn.Linear(output_dim * 2, output_dim)
         else:
@@ -296,7 +296,7 @@ def _tensorize_multimodal(
     dfg_ids: List[int] = []
     for x in dfg_nf[:max_dfg_nodes]:
         if isinstance(x, int):
-            dfg_ids.append(int(x) % 512)
+            dfg_ids.append(int(x))
         else:
             dfg_ids.append(0)
     if not dfg_ids:

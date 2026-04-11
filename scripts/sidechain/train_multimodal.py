@@ -397,7 +397,7 @@ def main():
             from utils.ghidra_runner import GhidraEnvironmentError, require_ghidra_environment
 
             require_ghidra_environment()
-        except GhidraEnvironmentError as e:
+        except (GhidraEnvironmentError, ImportError) as e:
             print(
                 f"错误: 未指定 --precomputed-features 时从索引动态提取需要 Ghidra: {e}",
                 file=sys.stderr,
@@ -407,7 +407,8 @@ def main():
     # 13.4：随机种子管理，保证可复现
     from experiment_meta import set_deterministic
 
-    set_deterministic(args.seed)
+    seed = args.seed
+    set_deterministic(seed)
 
     default_index = os.path.join(PROJECT_ROOT, "data", "binkit_functions.json")
     default_save = os.path.join(PROJECT_ROOT, "output", "best_model.pth")
