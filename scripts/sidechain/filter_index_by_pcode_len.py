@@ -79,9 +79,31 @@ def _is_trivial_getset_symbol(fn_name: str, mm: Dict[str, Any]) -> bool:
     return sl <= 16 and nn <= 3
 
 
+def _count_pcode_tokens_from_target(target: Dict[str, Any]) -> int:
+    """直接从 lsir_raw 单函数片段数 pcode tokens，跳过 normalize/build_lsir/feature_extract 全管道。"""
+    ntok = 0
+    for bb in target.get("basic_blocks") or []:
+        if not isinstance(bb, dict):
+            continue
+        for inst in bb.get("instructions") or []:
+            if not isinstance(inst, dict):
+                continue
+            ntok += len(inst.get("pcode") or [])
+    return ntok
+
+
+def _count_basic_blocks_from_target(target: Dict[str, Any]) -> int:
+    """直接数基本块数量，不走 build_lsir。"""
+    bbs = target.get("basic_blocks") or []
+    return sum(1 for bb in bbs if isinstance(bb, dict))
+
+
 def _pcode_filter_worker(payload: Tuple[Dict[str, Any], int, int, bool, str]) -> Tuple[str, Any]:
     """
     子进程任务：仅携带单函数 LSIR 片段，不把整份 lsir_raw 传入子进程。
+
+    优化：先用 _count_pcode_tokens_from_target 快速淘汰短函数，
+    只对通过阈值的函数跑完整 multimodal 提取管道。
 
     payload: (target, min_pcode_len, min_basic_blocks, exclude_getter_setter, fn_name)
 
@@ -91,17 +113,22 @@ def _pcode_filter_worker(payload: Tuple[Dict[str, Any], int, int, bool, str]) ->
     """
     target, min_pcode_len, min_basic_blocks, exclude_getter_setter, fn_name = payload
     try:
+        # ── 快速淘汰：直接数 tokens，跳过 normalize + build_lsir + 4 次 extract + fuse ──
+        ntok = _count_pcode_tokens_from_target(target)
+        if ntok < min_pcode_len:
+            return ("short", ntok)
+
+        if min_basic_blocks > 0:
+            nn = _count_basic_blocks_from_target(target)
+            if nn < min_basic_blocks:
+                return ("short_bb", nn)
+
+        # ── 通过阈值才跑完整管道 ──
         from utils.feature_extractors import extract_multimodal_from_lsir_raw
 
         entry = target.get("entry", "")
         mm = extract_multimodal_from_lsir_raw([target], entry)
-        tokens = mm.get("sequence", {}).get("pcode_tokens") or []
-        ntok = len(tokens)
-        if ntok < min_pcode_len:
-            return ("short", ntok)
-        nn = int((mm.get("graph") or {}).get("num_nodes") or 0)
-        if min_basic_blocks > 0 and nn < min_basic_blocks:
-            return ("short_bb", nn)
+
         if exclude_getter_setter and _is_trivial_getset_symbol(fn_name, mm):
             return ("trivial_getset", 0)
         return ("keep", mm)
@@ -251,50 +278,192 @@ def _filter_index(
         slots = [None] * n
         completed_binaries = set()
 
-    for b_i, binary_abs in enumerate(sorted_binaries, start=1):
-        if binary_abs in completed_binaries:
-            logger.info(
-                "[%d/%d] 跳过已完成二进制: %s",
-                b_i,
-                len(sorted_binaries),
-                binary_abs,
-            )
-            continue
-        entries = groups[binary_abs]
-        first_idx = min(i for i, _ in entries)
-        binary_feature_buffer: List[Tuple[str, Dict[str, Any]]] = []
+    # 进程池在所有二进制间复用，避免每个二进制都 fork/shutdown 一次
+    ex_global = (
+        _process_pool_executor(proc_cap, pool_max_tasks_per_child=pool_max_tasks_per_child)
+        if proc_cap > 1
+        else None
+    )
 
-        lsir_raw: Any = peek_binary_cache(binary_abs)
-        ghidra_failed = False
+    try:
+        for b_i, binary_abs in enumerate(sorted_binaries, start=1):
+            if binary_abs in completed_binaries:
+                logger.info(
+                    "[%d/%d] 跳过已完成二进制: %s",
+                    b_i,
+                    len(sorted_binaries),
+                    binary_abs,
+                )
+                continue
+            entries = groups[binary_abs]
+            first_idx = min(i for i, _ in entries)
+            binary_feature_buffer: List[Tuple[str, Dict[str, Any]]] = []
 
-        if lsir_raw is None:
-            tmp_dir = tempfile.mkdtemp(dir=temp_dir, prefix=f"filter_{first_idx}_")
-            try:
+            lsir_raw: Any = peek_binary_cache(binary_abs)
+            ghidra_failed = False
 
-                def _run_ghidra() -> Any:
-                    return run_ghidra_analysis(
-                        binary_path=binary_abs,
-                        output_dir=tmp_dir,
-                        project_name=f"Filter_{first_idx}",
-                        script_name="extract_lsir_raw.java",
-                        script_output_name="lsir_raw.json",
-                        return_dict=True,
-                    )
-
+            if lsir_raw is None:
+                tmp_dir = tempfile.mkdtemp(dir=temp_dir, prefix=f"filter_{first_idx}_")
                 try:
-                    lsir_raw = bounded_task(sem, _run_ghidra)
-                except Exception as e:
-                    logger.warning(
-                        "Ghidra 处理失败 %s: %s", binary_abs, e, exc_info=True
-                    )
-                    ghidra_failed = True
-            finally:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        if ghidra_failed:
-            for idx, _item in entries:
-                slots[idx - 1] = None
-                binaries_dropped += 1
+                    def _run_ghidra() -> Any:
+                        return run_ghidra_analysis(
+                            binary_path=binary_abs,
+                            output_dir=tmp_dir,
+                            project_name=f"Filter_{first_idx}",
+                            script_name="extract_lsir_raw.java",
+                            script_output_name="lsir_raw.json",
+                            return_dict=True,
+                        )
+
+                    try:
+                        lsir_raw = bounded_task(sem, _run_ghidra)
+                    except Exception as e:
+                        logger.warning(
+                            "Ghidra 处理失败 %s: %s", binary_abs, e, exc_info=True
+                        )
+                        ghidra_failed = True
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            if ghidra_failed:
+                for idx, _item in entries:
+                    slots[idx - 1] = None
+                    binaries_dropped += 1
+                completed_binaries.add(binary_abs)
+                if on_binary_done is not None:
+                    on_binary_done(
+                        {
+                            "completed_binary": binary_abs,
+                            "completed_binaries": sorted(completed_binaries),
+                            "slots": slots,
+                            "counters": {
+                                "total_original": total_original,
+                                "total_kept": total_kept,
+                                "binaries_dropped": binaries_dropped,
+                            },
+                        }
+                    )
+                continue
+
+            lsir_blob = lsir_raw or {}
+            lsir_funcs = list(lsir_blob.get("functions") or [])
+            warn_if_large_lsir(binary_label=binary_abs, num_functions=len(lsir_funcs))
+            entry_index = _build_lsir_entry_index(lsir_funcs)
+
+            def _one_index_row(idx: int, item: dict) -> None:
+                nonlocal total_original, total_kept, binaries_dropped
+
+                binary_rel = item.get("binary", "")
+                funcs = item.get("functions", [])
+                kept_funcs: list = []
+                row_total_orig = 0
+                row_total_kept = 0
+
+                work: List[Tuple[dict, Dict[str, Any]]] = []
+                for fn in funcs:
+                    entry = fn.get("entry", "")
+                    if not entry:
+                        logger.warning("索引项 %d 中函数缺少 entry，跳过", idx)
+                        continue
+
+                    fn_name = (fn.get("name") or "").strip()
+                    if name_filter is not None and name_filter(fn_name):
+                        logger.debug(
+                            "跳过 %s: 训练符号排除",
+                            _function_id(binary_rel, entry),
+                        )
+                        continue
+
+                    row_total_orig += 1
+                    target = _lookup_lsir_target(entry_index, lsir_funcs, entry)
+                    if target is None:
+                        logger.warning(
+                            "跳过 %s: entry 在 lsir_raw 中未找到",
+                            _function_id(binary_rel, entry),
+                        )
+                        continue
+                    work.append((fn, target))
+
+                payloads = [
+                    (
+                        t,
+                        min_pcode_len,
+                        int(min_basic_blocks),
+                        bool(exclude_getter_setter),
+                        (fn.get("name") or ""),
+                    )
+                    for fn, t in work
+                ]
+                n_work = len(payloads)
+
+                if ex_global is not None and n_work > 1:
+                    # chunksize=1 + 迭代消费，降低进程结果队列中同时驻留的大对象数量
+                    chunksize = 1 if feature_sink is not None else max(1, n_work // (4 * proc_cap + 1))
+                    result_iter = ex_global.map(_pcode_filter_worker, payloads, chunksize=chunksize)
+                    pairs = zip(work, result_iter)
+                else:
+                    pairs = ((wrow, _pcode_filter_worker(p)) for wrow, p in zip(work, payloads))
+
+                for (fn, _t), (status, detail) in pairs:
+                    fid = _function_id(binary_rel, fn.get("entry", ""))
+                    if status == "keep":
+                        kept_funcs.append(fn)
+                        row_total_kept += 1
+                        if isinstance(detail, dict):
+                            if feature_sink is not None:
+                                binary_feature_buffer.append((fid, detail))
+                            if kept_features is not None:
+                                kept_features[fid] = detail
+                    elif status == "short":
+                        logger.debug(
+                            "跳过 %s: len(pcode_tokens)=%s < %d",
+                            fid,
+                            detail,
+                            min_pcode_len,
+                        )
+                    elif status == "short_bb":
+                        logger.debug(
+                            "跳过 %s: graph.num_nodes=%s < min_basic_blocks=%d",
+                            fid,
+                            detail,
+                            min_basic_blocks,
+                        )
+                    elif status == "trivial_getset":
+                        logger.debug("跳过 %s: trivial getter/setter 启发式", fid)
+                    else:
+                        logger.warning("跳过 %s: %s", fid, detail)
+
+                if kept_funcs:
+                    slots[idx - 1] = {"binary": binary_rel, "functions": kept_funcs}
+                    bdrop = 0
+                else:
+                    slots[idx - 1] = None
+                    bdrop = 1
+
+                total_original += row_total_orig
+                total_kept += row_total_kept
+                binaries_dropped += bdrop
+
+                logger.info(
+                    "[%d/%d] [%d/%d] %s: %d/%d 函数保留",
+                    idx,
+                    n,
+                    b_i,
+                    len(sorted_binaries),
+                    binary_rel,
+                    row_total_kept,
+                    len(funcs),
+                )
+
+            ordered = sorted(entries, key=lambda x: x[0])
+            for idx, item in ordered:
+                _one_index_row(idx, item)
+
+            if feature_sink is not None and binary_feature_buffer:
+                for fid, mm in binary_feature_buffer:
+                    feature_sink(fid, mm)
+
             completed_binaries.add(binary_abs)
             if on_binary_done is not None:
                 on_binary_done(
@@ -309,155 +478,12 @@ def _filter_index(
                         },
                     }
                 )
-            continue
 
-        lsir_blob = lsir_raw or {}
-        lsir_funcs = list(lsir_blob.get("functions") or [])
-        warn_if_large_lsir(binary_label=binary_abs, num_functions=len(lsir_funcs))
-        entry_index = _build_lsir_entry_index(lsir_funcs)
-
-        # 每个二进制只建一次进程池，避免每条索引行反复 fork/shutdown。
-        ex_bin = (
-            _process_pool_executor(proc_cap, pool_max_tasks_per_child=pool_max_tasks_per_child)
-            if proc_cap > 1
-            else None
-        )
-
-        def _one_index_row(idx: int, item: dict) -> None:
-            nonlocal total_original, total_kept, binaries_dropped
-
-            binary_rel = item.get("binary", "")
-            funcs = item.get("functions", [])
-            kept_funcs: list = []
-            row_total_orig = 0
-            row_total_kept = 0
-
-            work: List[Tuple[dict, Dict[str, Any]]] = []
-            for fn in funcs:
-                entry = fn.get("entry", "")
-                if not entry:
-                    logger.warning("索引项 %d 中函数缺少 entry，跳过", idx)
-                    continue
-
-                fn_name = (fn.get("name") or "").strip()
-                if name_filter is not None and name_filter(fn_name):
-                    logger.debug(
-                        "跳过 %s: 训练符号排除",
-                        _function_id(binary_rel, entry),
-                    )
-                    continue
-
-                row_total_orig += 1
-                target = _lookup_lsir_target(entry_index, lsir_funcs, entry)
-                if target is None:
-                    logger.warning(
-                        "跳过 %s: entry 在 lsir_raw 中未找到",
-                        _function_id(binary_rel, entry),
-                    )
-                    continue
-                work.append((fn, target))
-
-            payloads = [
-                (
-                    t,
-                    min_pcode_len,
-                    int(min_basic_blocks),
-                    bool(exclude_getter_setter),
-                    (fn.get("name") or ""),
-                )
-                for fn, t in work
-            ]
-            n_work = len(payloads)
-
-            if ex_bin is not None and n_work > 1:
-                # chunksize=1 + 迭代消费，降低进程结果队列中同时驻留的大对象数量
-                chunksize = 1 if feature_sink is not None else max(1, n_work // (4 * proc_cap + 1))
-                result_iter = ex_bin.map(_pcode_filter_worker, payloads, chunksize=chunksize)
-                pairs = zip(work, result_iter)
-            else:
-                pairs = ((wrow, _pcode_filter_worker(p)) for wrow, p in zip(work, payloads))
-
-            for (fn, _t), (status, detail) in pairs:
-                fid = _function_id(binary_rel, fn.get("entry", ""))
-                if status == "keep":
-                    kept_funcs.append(fn)
-                    row_total_kept += 1
-                    if isinstance(detail, dict):
-                        if feature_sink is not None:
-                            binary_feature_buffer.append((fid, detail))
-                        if kept_features is not None:
-                            kept_features[fid] = detail
-                elif status == "short":
-                    logger.debug(
-                        "跳过 %s: len(pcode_tokens)=%s < %d",
-                        fid,
-                        detail,
-                        min_pcode_len,
-                    )
-                elif status == "short_bb":
-                    logger.debug(
-                        "跳过 %s: graph.num_nodes=%s < min_basic_blocks=%d",
-                        fid,
-                        detail,
-                        min_basic_blocks,
-                    )
-                elif status == "trivial_getset":
-                    logger.debug("跳过 %s: trivial getter/setter 启发式", fid)
-                else:
-                    logger.warning("跳过 %s: %s", fid, detail)
-
-            if kept_funcs:
-                slots[idx - 1] = {"binary": binary_rel, "functions": kept_funcs}
-                bdrop = 0
-            else:
-                slots[idx - 1] = None
-                bdrop = 1
-
-            total_original += row_total_orig
-            total_kept += row_total_kept
-            binaries_dropped += bdrop
-
-            logger.info(
-                "[%d/%d] [%d/%d] %s: %d/%d 函数保留",
-                idx,
-                n,
-                b_i,
-                len(sorted_binaries),
-                binary_rel,
-                row_total_kept,
-                len(funcs),
-            )
-
-        ordered = sorted(entries, key=lambda x: x[0])
-        if ex_bin is not None:
-            with ex_bin:
-                for idx, item in ordered:
-                    _one_index_row(idx, item)
-        else:
-            for idx, item in ordered:
-                _one_index_row(idx, item)
-
-        if feature_sink is not None and binary_feature_buffer:
-            for fid, mm in binary_feature_buffer:
-                feature_sink(fid, mm)
-
-        completed_binaries.add(binary_abs)
-        if on_binary_done is not None:
-            on_binary_done(
-                {
-                    "completed_binary": binary_abs,
-                    "completed_binaries": sorted(completed_binaries),
-                    "slots": slots,
-                    "counters": {
-                        "total_original": total_original,
-                        "total_kept": total_kept,
-                        "binaries_dropped": binaries_dropped,
-                    },
-                }
-            )
-
-        del lsir_blob, lsir_funcs, entry_index, lsir_raw
-        maybe_gc_after_binary(gc_after_each_binary)
+            del lsir_blob, lsir_funcs, entry_index, lsir_raw
+            maybe_gc_after_binary(gc_after_each_binary)
+    finally:
+        if ex_global is not None:
+            ex_global.shutdown(wait=True)
 
     output_items = [row for row in slots if row is not None]
 
