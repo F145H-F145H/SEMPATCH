@@ -198,7 +198,7 @@ def main() -> None:
         if not binaries:
             print("错误: 索引中无有效二进制路径", file=sys.stderr)
             sys.exit(1)
-        print(f"从索引 {args.from_index_file} 得到 {len(binaries)} 个二进制（已去重）")
+        print(f"从索引 {args.from_index_file} 得到 {len(binaries)} 个二进制（已去重）", flush=True)
     else:
         input_dir = os.path.abspath(
             args.input_dir
@@ -225,7 +225,7 @@ def main() -> None:
     else:
         session_temp_dir = tempfile.mkdtemp(prefix="sempatch_binkit_")
 
-    print(f"找到 {len(binaries)} 个二进制，开始提取函数列表...")
+    print(f"找到 {len(binaries)} 个二进制，开始提取函数列表...", flush=True)
 
     try:
         from utils.ghidra_runner import GhidraEnvironmentError, require_ghidra_environment
@@ -243,18 +243,23 @@ def main() -> None:
     use_parallel = len(binaries) > 1 and workers > 0
     force = args.force
 
-    def _process_binary(idx_and_path):
+    def _process_binary_fast(idx_and_path):
+        """快速路径：仅尝试缓存命中，不拿信号量。返回 None 表示需要走慢速路径。"""
         idx, bin_path = idx_and_path
         binary_abs = os.path.abspath(bin_path)
         rel_path = _output_binary_field(binary_abs)
-
-        # Plan B: 缓存未命中或 force 时才创建子目录并调用 Ghidra
         if not force:
             lsir_raw = peek_binary_cache(binary_abs)
             if lsir_raw is not None:
                 return (idx, rel_path, _lsir_to_funcs(lsir_raw, name_filter=name_filter))
+        return None  # 需要走慢速路径
 
-        # 缓存未命中（或 force）：创建独立子目录，用毕立即删除
+    def _process_binary_slow(idx_and_path):
+        """慢速路径：缓存未命中或 force，创建临时目录调用 Ghidra。需要在 bounded_task 内运行。"""
+        idx, bin_path = idx_and_path
+        binary_abs = os.path.abspath(bin_path)
+        rel_path = _output_binary_field(binary_abs)
+
         output_subdir = os.path.join(session_temp_dir, f"v{idx}")
         os.makedirs(output_subdir, exist_ok=True)
         lsir_raw = None
@@ -269,7 +274,7 @@ def main() -> None:
                 return_dict=True,
             )
         except Exception as e:
-            print(f"警告: 处理失败 {rel_path}: {e}", file=sys.stderr)
+            print(f"警告: 处理失败 {rel_path}: {e}", file=sys.stderr, flush=True)
         finally:
             shutil.rmtree(output_subdir, ignore_errors=True)
 
@@ -284,24 +289,61 @@ def main() -> None:
     try:
         if use_parallel:
             max_workers = min(len(binaries), workers)
-            print(f"使用 {max_workers} 线程并行提取")
+            print(f"使用 {max_workers} 线程并行提取", flush=True)
+
+            # === 第一轮：快速路径，并发检查缓存，不拿信号量 ===
+            pending = []  # 缓存未命中的任务
+            hit_count = 0
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = {
-                    ex.submit(bounded_task, sem, _process_binary, (idx, path)): idx
+                fast_futures = {
+                    ex.submit(_process_binary_fast, (idx, path)): idx
                     for idx, path in tasks
                 }
-                for fut in as_completed(futures):
-                    idx = futures[fut]
-                    _, rel_path, funcs = fut.result()
-                    if funcs is not None:
-                        index_slots[idx - 1] = {"binary": rel_path, "functions": funcs}
-                        print(f"  [{idx}/{len(binaries)}] {rel_path}: {len(funcs)} 函数")
+                for fut in as_completed(fast_futures):
+                    idx = fast_futures[fut]
+                    result = fut.result()
+                    if result is not None:
+                        _, rel_path, funcs = result
+                        if funcs is not None:
+                            index_slots[idx - 1] = {"binary": rel_path, "functions": funcs}
+                            hit_count += 1
+                            print(f"  [{idx}/{len(binaries)}] {rel_path}: {len(funcs)} 函数", flush=True)
+                    else:
+                        pending.append((idx, binaries[idx - 1]))
+
+            if not force:
+                print(f"缓存命中: {hit_count}/{len(binaries)}", flush=True)
+
+            # === 第二轮：缓存未命中的，拿信号量跑 Ghidra ===
+            if pending:
+                print(f"缓存未命中: {len(pending)} 个二进制，启动 Ghidra 分析...", flush=True)
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    slow_futures = {
+                        ex.submit(bounded_task, sem, _process_binary_slow, (idx, path)): idx
+                        for idx, path in pending
+                    }
+                    for fut in as_completed(slow_futures):
+                        idx = slow_futures[fut]
+                        try:
+                            _, rel_path, funcs = fut.result()
+                            if funcs is not None:
+                                index_slots[idx - 1] = {"binary": rel_path, "functions": funcs}
+                                print(f"  [{idx}/{len(binaries)}] {rel_path}: {len(funcs)} 函数", flush=True)
+                        except Exception as e:
+                            print(f"  [{idx}/{len(binaries)}] 处理失败: {e}", file=sys.stderr, flush=True)
         else:
             for idx, bin_path in tasks:
-                _, rel_path, funcs = _process_binary((idx, bin_path))
-                if funcs is not None:
-                    index_slots[idx - 1] = {"binary": rel_path, "functions": funcs}
-                    print(f"  [{idx}/{len(binaries)}] {rel_path}: {len(funcs)} 函数")
+                result = _process_binary_fast((idx, bin_path))
+                if result is not None:
+                    _, rel_path, funcs = result
+                    if funcs is not None:
+                        index_slots[idx - 1] = {"binary": rel_path, "functions": funcs}
+                        print(f"  [{idx}/{len(binaries)}] {rel_path}: {len(funcs)} 函数", flush=True)
+                else:
+                    _, rel_path, funcs = _process_binary_slow((idx, bin_path))
+                    if funcs is not None:
+                        index_slots[idx - 1] = {"binary": rel_path, "functions": funcs}
+                        print(f"  [{idx}/{len(binaries)}] {rel_path}: {len(funcs)} 函数", flush=True)
     finally:
         # session temp_dir 及所有残留子目录统一清理
         shutil.rmtree(session_temp_dir, ignore_errors=True)
@@ -313,7 +355,7 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2, ensure_ascii=False)
 
-    print(f"已写入 {out_path}: {len(index)} 个二进制, {total_funcs} 个函数")
+    print(f"已写入 {out_path}: {len(index)} 个二进制, {total_funcs} 个函数", flush=True)
 
 
 if __name__ == "__main__":
