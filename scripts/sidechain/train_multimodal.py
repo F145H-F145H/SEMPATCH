@@ -83,6 +83,7 @@ def _make_step_fn(
     max_seq_len: int = 512,
     max_graph_nodes: int = 128,
     max_dfg_nodes: int = 128,
+    pcode_vocab_size: int = 256,
 ):
     """构建训练步进函数：tensorize -> model -> loss + accuracy。"""
 
@@ -109,6 +110,7 @@ def _make_step_fn(
                 max_seq_len=max_seq_len,
                 max_graph_nodes=max_graph_nodes,
                 max_dfg_nodes=max_dfg_nodes,
+                pcode_vocab_size=pcode_vocab_size,
             )
             batch2 = tensorize_multimodal_many(
                 f2_list,
@@ -117,9 +119,12 @@ def _make_step_fn(
                 max_seq_len=max_seq_len,
                 max_graph_nodes=max_graph_nodes,
                 max_dfg_nodes=max_dfg_nodes,
+                pcode_vocab_size=pcode_vocab_size,
             )
             v1 = model(*batch1)
             v2 = model(*batch2)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             if v1.dim() == 1:
                 v1 = v1.unsqueeze(0)
             if v2.dim() == 1:
@@ -146,6 +151,7 @@ def _make_step_fn(
                     max_seq_len=max_seq_len,
                     max_graph_nodes=max_graph_nodes,
                     max_dfg_nodes=max_dfg_nodes,
+                    pcode_vocab_size=pcode_vocab_size,
                 )
                 t2, j2, n2, e2, p2, d2n, d2e = _tensorize_multimodal(
                     f2,
@@ -154,6 +160,7 @@ def _make_step_fn(
                     max_seq_len=max_seq_len,
                     max_graph_nodes=max_graph_nodes,
                     max_dfg_nodes=max_dfg_nodes,
+                    pcode_vocab_size=pcode_vocab_size,
                 )
                 v1 = model(
                     t1,
@@ -184,7 +191,7 @@ def _make_step_fn(
                 continue
 
         if not vec1_list:
-            return torch.tensor(0.0, device=device, requires_grad=True), 0, 0
+            return torch.tensor(0.0, requires_grad=True), 0, 0
 
         vec1 = torch.cat(vec1_list, dim=0)
         vec2 = torch.cat(vec2_list, dim=0)
@@ -686,6 +693,7 @@ def main():
         max_seq_len=max(1, int(args.max_seq_len)),
         max_graph_nodes=max(1, int(args.max_graph_nodes)),
         max_dfg_nodes=max(1, int(args.max_dfg_nodes)),
+        pcode_vocab_size=int(vocab_size),
     )
 
     # 13.1：默认启用 TensorBoard；--no-tb 显式禁用

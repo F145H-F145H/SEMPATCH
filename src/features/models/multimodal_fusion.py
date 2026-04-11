@@ -232,6 +232,22 @@ class MultiModalFusionModel(nn.Module if TORCH_AVAILABLE else object):
         return out
 
 
+def _clamp_edge_index(edge_idx: List[List[int]], num_nodes: int) -> List[List[int]]:
+    """Filter out-of-range or negative edge indices."""
+    if not edge_idx or len(edge_idx) < 2 or not edge_idx[0]:
+        return edge_idx if edge_idx else [[], []]
+    src, dst = edge_idx[0], edge_idx[1]
+    good = [(s, d) for s, d in zip(src, dst) if 0 <= s < num_nodes and 0 <= d < num_nodes]
+    if not good:
+        return [[], []]
+    return [[s for s, _ in good], [d for _, d in good]]
+
+
+def _clamp_ids(ids: List[int], max_val: int, unk: int = 1) -> List[int]:
+    """Clamp index values to [0, max_val), replacing out-of-range with unk."""
+    return [unk if v < 0 or v >= max_val else v for v in ids]
+
+
 def _tensorize_multimodal(
     multimodal: Dict[str, Any],
     vocab: Dict[str, int],
@@ -239,6 +255,7 @@ def _tensorize_multimodal(
     max_seq_len: int = 512,
     max_graph_nodes: int = 128,
     max_dfg_nodes: int = 128,
+    pcode_vocab_size: int = 256,
 ) -> Tuple[
     "torch.Tensor",
     "torch.Tensor",
@@ -262,7 +279,8 @@ def _tensorize_multimodal(
     graph = multimodal.get("graph") or {}
     tokens = seq.get("pcode_tokens") or []
     jump_mask = seq.get("jump_mask") or []
-    token_ids = [vocab.get(t, 1) for t in tokens[:max_seq_len]]
+    token_ids_raw = [vocab.get(t, 1) for t in tokens[:max_seq_len]]
+    token_ids = _clamp_ids(token_ids_raw, pcode_vocab_size)
     jump = list(jump_mask[:max_seq_len])
     if not token_ids:
         token_ids = [1]
@@ -283,8 +301,10 @@ def _tensorize_multimodal(
         nf_flat.append(idx)
     if not nf_flat:
         nf_flat = [0]
+    nf_flat = _clamp_ids(nf_flat, pcode_vocab_size)
     node_t = torch.tensor([nf_flat], dtype=torch.long)
     edge_idx = graph.get("edge_index") or [[], []]
+    edge_idx = _clamp_edge_index(edge_idx, len(nf_flat))
     edge_t = (
         torch.tensor(edge_idx, dtype=torch.long)
         if edge_idx[0]
@@ -303,6 +323,7 @@ def _tensorize_multimodal(
         dfg_ids = [0]
     dfg_node_t = torch.tensor([dfg_ids], dtype=torch.long)
     dfg_e = dfg.get("edge_index") or [[], []]
+    dfg_e = _clamp_edge_index(dfg_e, len(dfg_ids))
     dfg_edge_t = (
         torch.tensor(dfg_e, dtype=torch.long) if dfg_e[0] else torch.zeros(2, 0, dtype=torch.long)
     )
@@ -325,6 +346,7 @@ def tensorize_multimodal_many(
     max_seq_len: int = 512,
     max_graph_nodes: int = 128,
     max_dfg_nodes: int = 128,
+    pcode_vocab_size: int = 256,
 ) -> Tuple[
     "torch.Tensor",
     "torch.Tensor",
@@ -358,7 +380,8 @@ def tensorize_multimodal_many(
         graph = mm.get("graph") or {}
         tokens = seq.get("pcode_tokens") or []
         jump_mask = seq.get("jump_mask") or []
-        token_ids = [vocab.get(t, 1) for t in tokens[:max_seq_len]]
+        token_ids_raw = [vocab.get(t, 1) for t in tokens[:max_seq_len]]
+        token_ids = _clamp_ids(token_ids_raw, pcode_vocab_size)
         jump = list(jump_mask[:max_seq_len])
         if not token_ids:
             token_ids = [1]
@@ -374,9 +397,11 @@ def tensorize_multimodal_many(
             nf_flat.append(idx)
         if not nf_flat:
             nf_flat = [0]
+        nf_flat = _clamp_ids(nf_flat, pcode_vocab_size)
         per_item_nodes.append(nf_flat)
 
         edge_idx = graph.get("edge_index") or [[], []]
+        edge_idx = _clamp_edge_index(edge_idx, len(nf_flat))
         per_item_edges.append(edge_idx)
 
         dfg = mm.get("dfg") or {}
@@ -392,6 +417,7 @@ def tensorize_multimodal_many(
         per_item_dfg_nodes.append(dfg_ids)
 
         dfg_e = dfg.get("edge_index") or [[], []]
+        dfg_e = _clamp_edge_index(dfg_e, len(dfg_ids))
         per_item_dfg_edges.append(dfg_e)
 
     # -- Pass 2: compute batch maxima --
@@ -458,16 +484,12 @@ def tensorize_multimodal_many(
         dfg_edge_dst_list.append(ddst)
 
     if max_actual_edges > 0:
-        edge_t = torch.stack(
-            [torch.cat(edge_src_list), torch.cat(edge_dst_list)]
-        )
+        edge_t = torch.stack([torch.cat(edge_src_list), torch.cat(edge_dst_list)])
     else:
         edge_t = torch.zeros(2, 0, dtype=torch.long)
 
     if max_actual_dfg_edges > 0:
-        dfg_edge_t = torch.stack(
-            [torch.cat(dfg_edge_src_list), torch.cat(dfg_edge_dst_list)]
-        )
+        dfg_edge_t = torch.stack([torch.cat(dfg_edge_src_list), torch.cat(dfg_edge_dst_list)])
     else:
         dfg_edge_t = torch.zeros(2, 0, dtype=torch.long)
 
