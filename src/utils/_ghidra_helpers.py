@@ -34,8 +34,14 @@ class GhidraEnvironmentError(SemPatchError):
     """Raised when Ghidra environment is invalid."""
 
 
+_GHIDRA_VALIDATED: bool = False
+
+
 def validate_ghidra_environment() -> None:
-    """校验 Ghidra 安装与路径。失败时抛出 GhidraEnvironmentError。"""
+    """校验 Ghidra 安装与路径。失败时抛出 GhidraEnvironmentError。校验结果缓存，避免重复检查。"""
+    global _GHIDRA_VALIDATED
+    if _GHIDRA_VALIDATED:
+        return
     if not GHIDRA_HOME or not os.path.isdir(GHIDRA_HOME):
         raise GhidraEnvironmentError(f"Ghidra home not found: {GHIDRA_HOME}")
     if not os.path.isfile(ANALYZE_HEADLESS):
@@ -44,6 +50,7 @@ def validate_ghidra_environment() -> None:
         raise GhidraEnvironmentError(f"analyzeHeadless is not executable: {ANALYZE_HEADLESS}")
     logger.progress("Validating Ghidra environment")
     logger.success("Ghidra environment validated")
+    _GHIDRA_VALIDATED = True
 
 
 def can_skip_ghidra(binary_path: str, script_output_path: str) -> bool:
@@ -184,23 +191,51 @@ def read_from_binary_cache(
     return script_output_path
 
 
+_PEEK_CACHE: dict[str, dict] = {}
+_PEEK_MISS: set[str] = set()
+_PEEK_CACHE_MAX: int = 3  # 仅保留最近 N 个 peek 结果，避免累积持有全部 lsir_raw dict
+
+
+def clear_peek_cache() -> None:
+    """释放 peek 缓存持有的全部 lsir_raw dict 引用，供批处理循环中主动调用。"""
+    _PEEK_CACHE.clear()
+
+
 def peek_binary_cache(binary_path: str) -> Optional[dict]:
     """
     若 binary_cache 中存在有效 lsir_raw.json，直接读取并返回解析后的 dict。
+    结果缓存在进程内内存中，相同 binary_path 不重复读磁盘。
 
     不执行任何文件复制，不创建临时目录，仅做存在性检查与 JSON 解析。
     BINARY_CACHE_DIR 未配置或缓存不存在时返回 None。
     复用 binary_cache_key 与 try_get_binary_cache_dir，与 read_from_binary_cache 键逻辑一致。
+
+    注意：_PEEK_CACHE 容量受 _PEEK_CACHE_MAX 限制，超出时清空重建，
+    避免在批处理 2000+ 二进制时累积持有数 GB 的 lsir_raw dict 引用。
+    调用方可通过 clear_peek_cache() 在循环中主动释放。
     """
+    abs_path = os.path.abspath(binary_path)
+    if abs_path in _PEEK_MISS:
+        return None
+    if abs_path in _PEEK_CACHE:
+        return _PEEK_CACHE[abs_path]
     cache_dir = try_get_binary_cache_dir()
     if not cache_dir:
+        _PEEK_MISS.add(abs_path)
         return None
-    key = binary_cache_key(binary_path)
+    key = binary_cache_key(abs_path)
     cached_path = os.path.join(cache_dir, key, "lsir_raw.json")
     if not os.path.isfile(cached_path) or os.path.getsize(cached_path) == 0:
+        _PEEK_MISS.add(abs_path)
         return None
     try:
         with open(cached_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # 容量控制：超出上限时清空缓存（_PEEK_MISS 保留，仅清数据缓存）
+        if len(_PEEK_CACHE) >= _PEEK_CACHE_MAX:
+            _PEEK_CACHE.clear()
+        _PEEK_CACHE[abs_path] = data
+        return data
     except (OSError, json.JSONDecodeError):
+        _PEEK_MISS.add(abs_path)
         return None

@@ -3,6 +3,7 @@
 孪生网络训练脚本：MultiModalFusionModel + 成对对比学习。
 支持 BinKit 索引与合成数据。
 """
+
 import argparse
 import random
 import os
@@ -56,6 +57,7 @@ def _load_train_config(path: str) -> dict:
     """从 YAML 文件加载训练配置；职责单一，供 main 使用。"""
     try:
         import yaml
+
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return dict(data) if isinstance(data, dict) else {}
@@ -116,12 +118,22 @@ def _make_step_fn(
                     max_dfg_nodes=max_dfg_nodes,
                 )
                 v1 = model(
-                    t1, j1, n1, e1, p1,
-                    dfg_node_features=d1n, dfg_edge_index=d1e,
+                    t1,
+                    j1,
+                    n1,
+                    e1,
+                    p1,
+                    dfg_node_features=d1n,
+                    dfg_edge_index=d1e,
                 )
                 v2 = model(
-                    t2, j2, n2, e2, p2,
-                    dfg_node_features=d2n, dfg_edge_index=d2e,
+                    t2,
+                    j2,
+                    n2,
+                    e2,
+                    p2,
+                    dfg_node_features=d2n,
+                    dfg_edge_index=d2e,
                 )
                 if v1.dim() == 1:
                     v1 = v1.unsqueeze(0)
@@ -143,7 +155,7 @@ def _make_step_fn(
         loss = _loss_fn(vec1, vec2, labels)
         cos_sim = torch.nn.functional.cosine_similarity(vec1, vec2, dim=1)
         pred_sim = (cos_sim > threshold).float()
-        correct = ((pred_sim == labels).float().sum().item())
+        correct = (pred_sim == labels).float().sum().item()
         return loss, int(correct), n
 
     return step_fn
@@ -161,48 +173,136 @@ def main():
 
     parser.add_argument("--index-file", default=None, help="binkit_functions.json 路径")
     parser.add_argument("--synthetic", action="store_true", help="使用合成数据")
-    parser.add_argument("--synthetic-file", default=None, help="合成数据 JSON 路径（--synthetic 时）")
+    parser.add_argument(
+        "--synthetic-file", default=None, help="合成数据 JSON 路径（--synthetic 时）"
+    )
     parser.add_argument("--epochs", type=int, default=cfg.get("epochs", 20), help="训练 epoch 数")
-    parser.add_argument("--batch-size", type=int, default=cfg.get("batch_size", 8), help="batch size")
+    parser.add_argument(
+        "--batch-size", type=int, default=cfg.get("batch_size", 8), help="batch size"
+    )
     parser.add_argument("--lr", type=float, default=cfg.get("lr", 1e-4), help="学习率")
     parser.add_argument("--save-path", default=None, help="模型保存路径")
     parser.add_argument("--cache-dir", default=None, help="特征缓存目录")
-    parser.add_argument("--tb-dir", default=None, help="TensorBoard 目录；未指定时使用 output/tensorboard/<timestamp>")
+    parser.add_argument(
+        "--tb-dir",
+        default=None,
+        help="TensorBoard 目录；未指定时使用 output/tensorboard/<timestamp>",
+    )
     parser.add_argument("--no-tb", action="store_true", help="禁用 TensorBoard")
-    parser.add_argument("--precomputed-features", default=None, help="可选：预计算特征文件（{function_id: multimodal}），命中时优先读取")
+    parser.add_argument(
+        "--precomputed-features",
+        default=None,
+        help="可选：预计算特征文件（{function_id: multimodal}），命中时优先读取",
+    )
     parser.add_argument(
         "--vocab-from-features",
         default=None,
         help="从特征文件构建词表：.json 为整表加载（大库易 OOM）；JSONL 侧车流式扫描（推荐）",
     )
-    parser.add_argument("--num-pairs", type=int, default=cfg.get("num_pairs", 2000), help="数据集对数（真实数据时）")
-    parser.add_argument("--vocab-size", type=int, default=cfg.get("vocab_size", 256), help="P-code vocab 大小")
-    parser.add_argument("--use-disk-cache", action="store_true", help="启用特征磁盘缓存（默认已启用，可省略）")
+    parser.add_argument(
+        "--num-pairs", type=int, default=cfg.get("num_pairs", 2000), help="数据集对数（真实数据时）"
+    )
+    parser.add_argument(
+        "--vocab-size", type=int, default=cfg.get("vocab_size", 256), help="P-code vocab 大小"
+    )
+    parser.add_argument(
+        "--use-disk-cache", action="store_true", help="启用特征磁盘缓存（默认已启用，可省略）"
+    )
     parser.add_argument("--no-disk-cache", action="store_true", help="禁用特征磁盘缓存")
-    parser.add_argument("--num-workers", type=int, default=cfg.get("num_workers", 0), help="DataLoader worker 数（默认 0，降低 OOM 风险）")
-    parser.add_argument("--memory-cache-max-items", type=int, default=cfg.get("memory_cache_max_items", 16384), help="数据集进程内特征缓存上限（0=禁用；预计算 JSONL 训练建议 ≥8k，过小会反复解析侧车）")
-    parser.add_argument("--lsir-cache-max-binaries", type=int, default=cfg.get("lsir_cache_max_binaries", 2), help="数据集进程内 lsir_raw 缓存二进制上限（0=禁用）")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=cfg.get("num_workers", 0),
+        help="DataLoader worker 数（默认 0，降低 OOM 风险）",
+    )
+    parser.add_argument(
+        "--memory-cache-max-items",
+        type=int,
+        default=cfg.get("memory_cache_max_items", 16384),
+        help="数据集进程内特征缓存上限（0=禁用；预计算 JSONL 训练建议 ≥8k，过小会反复解析侧车）",
+    )
+    parser.add_argument(
+        "--lsir-cache-max-binaries",
+        type=int,
+        default=cfg.get("lsir_cache_max_binaries", 2),
+        help="数据集进程内 lsir_raw 缓存二进制上限（0=禁用）",
+    )
     parser.add_argument("--embed-dim", type=int, default=cfg.get("embed_dim", 64), help="嵌入维度")
-    parser.add_argument("--hidden-dim", type=int, default=cfg.get("hidden_dim", 128), help="隐藏层维度")
-    parser.add_argument("--num-gnn-layers", type=int, default=cfg.get("num_gnn_layers", 2), help="GNN 层数")
-    parser.add_argument("--num-transformer-layers", type=int, default=cfg.get("num_transformer_layers", 2), help="Transformer 层数")
-    parser.add_argument("--output-dim", type=int, default=cfg.get("output_dim", 128), help="输出嵌入维度")
-    parser.add_argument("--max-seq-len", type=int, default=cfg.get("max_seq_len", 512), help="单样本最大序列长度（越大越耗显存）")
-    parser.add_argument("--max-graph-nodes", type=int, default=cfg.get("max_graph_nodes", 128), help="单样本最大图节点数（越大越耗显存）")
+    parser.add_argument(
+        "--hidden-dim", type=int, default=cfg.get("hidden_dim", 128), help="隐藏层维度"
+    )
+    parser.add_argument(
+        "--num-gnn-layers", type=int, default=cfg.get("num_gnn_layers", 2), help="GNN 层数"
+    )
+    parser.add_argument(
+        "--num-transformer-layers",
+        type=int,
+        default=cfg.get("num_transformer_layers", 2),
+        help="Transformer 层数",
+    )
+    parser.add_argument(
+        "--output-dim", type=int, default=cfg.get("output_dim", 128), help="输出嵌入维度"
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=cfg.get("max_seq_len", 512),
+        help="单样本最大序列长度（越大越耗显存）",
+    )
+    parser.add_argument(
+        "--max-graph-nodes",
+        type=int,
+        default=cfg.get("max_graph_nodes", 128),
+        help="单样本最大图节点数（越大越耗显存）",
+    )
     parser.add_argument(
         "--use-dfg",
         action=argparse.BooleanOptionalAction,
         default=bool(cfg.get("use_dfg", True)),
         help="启用 DFG 图分支（默认开；--no-use-dfg 仅用于消融）；需与推理/checkpoint meta 一致",
     )
-    parser.add_argument("--max-dfg-nodes", type=int, default=cfg.get("max_dfg_nodes", 128), help="单样本 DFG 最大节点数")
-    parser.add_argument("--max-log-mb", type=int, default=cfg.get("max_log_mb", 32), help="单个日志文件最大大小（MB）")
-    parser.add_argument("--log-backups", type=int, default=cfg.get("log_backups", 5), help="日志滚动备份份数")
-    parser.add_argument("--log-level", default=cfg.get("log_level", "INFO"), help="日志级别（DEBUG/INFO/WARNING/ERROR）")
-    parser.add_argument("--max-tb-mb", type=int, default=cfg.get("max_tb_mb", 128), help="TensorBoard 根目录最大总大小（MB）")
-    parser.add_argument("--tb-keep-runs", type=int, default=cfg.get("tb_keep_runs", 5), help="TensorBoard 仅保留最近 N 个 run 目录")
-    parser.add_argument("--no-progress-bar", action="store_true", help="关闭 batch 级进度（tqdm 或周期性日志），仅保留每 epoch 汇总")
-    parser.add_argument("--no-epoch-cleanup", action="store_true", help="关闭每个 epoch 后的 gc/CUDA cache 清理（默认开启，降低 OOM 风险）")
+    parser.add_argument(
+        "--max-dfg-nodes",
+        type=int,
+        default=cfg.get("max_dfg_nodes", 128),
+        help="单样本 DFG 最大节点数",
+    )
+    parser.add_argument(
+        "--max-log-mb",
+        type=int,
+        default=cfg.get("max_log_mb", 32),
+        help="单个日志文件最大大小（MB）",
+    )
+    parser.add_argument(
+        "--log-backups", type=int, default=cfg.get("log_backups", 5), help="日志滚动备份份数"
+    )
+    parser.add_argument(
+        "--log-level",
+        default=cfg.get("log_level", "INFO"),
+        help="日志级别（DEBUG/INFO/WARNING/ERROR）",
+    )
+    parser.add_argument(
+        "--max-tb-mb",
+        type=int,
+        default=cfg.get("max_tb_mb", 128),
+        help="TensorBoard 根目录最大总大小（MB）",
+    )
+    parser.add_argument(
+        "--tb-keep-runs",
+        type=int,
+        default=cfg.get("tb_keep_runs", 5),
+        help="TensorBoard 仅保留最近 N 个 run 目录",
+    )
+    parser.add_argument(
+        "--no-progress-bar",
+        action="store_true",
+        help="关闭 batch 级进度（tqdm 或周期性日志），仅保留每 epoch 汇总",
+    )
+    parser.add_argument(
+        "--no-epoch-cleanup",
+        action="store_true",
+        help="关闭每个 epoch 后的 gc/CUDA cache 清理（默认开启，降低 OOM 风险）",
+    )
     parser.add_argument(
         "--progress-log-every",
         type=int,
@@ -306,6 +406,7 @@ def main():
 
     # 13.4：随机种子管理，保证可复现
     from experiment_meta import set_deterministic
+
     set_deterministic(args.seed)
 
     default_index = os.path.join(PROJECT_ROOT, "data", "binkit_functions.json")
@@ -315,6 +416,13 @@ def main():
     index_path = args.index_file or default_index
     save_path = args.save_path or default_save
     cache_dir = args.cache_dir or default_cache
+
+    # 自动发现 .training.jsonl（未指定 --precomputed-features 时）
+    if not args.precomputed_features:
+        inferred = os.path.splitext(index_path)[0] + ".training.jsonl"
+        if os.path.isfile(inferred):
+            print(f"自动发现训练特征文件: {inferred}")
+            args.precomputed_features = inferred
 
     _setup_rotating_logging(
         log_dir=os.path.join(PROJECT_ROOT, "output", "logs"),
@@ -330,24 +438,28 @@ def main():
     if args.wandb:
         try:
             import wandb
-            wandb_run = wandb.init(project=args.wandb_project, config={
-                "epochs": args.epochs,
-                "batch_size": args.batch_size,
-                "lr": args.lr,
-                "num_pairs": args.num_pairs,
-                "embed_dim": args.embed_dim,
-                "hidden_dim": args.hidden_dim,
-                "synthetic": args.synthetic,
-                "seed": args.seed,
-                "num_workers": args.num_workers,
-                "max_seq_len": args.max_seq_len,
-                "max_graph_nodes": args.max_graph_nodes,
-            })
+
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                config={
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "num_pairs": args.num_pairs,
+                    "embed_dim": args.embed_dim,
+                    "hidden_dim": args.hidden_dim,
+                    "synthetic": args.synthetic,
+                    "seed": args.seed,
+                    "num_workers": args.num_workers,
+                    "max_seq_len": args.max_seq_len,
+                    "max_graph_nodes": args.max_graph_nodes,
+                },
+            )
         except ImportError:
             log.warning("wandb 未安装，跳过 W&B 日志。运行: pip install wandb")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_pin_memory = (device.type == "cuda")
+    use_pin_memory = device.type == "cuda"
     num_workers = max(0, int(args.num_workers))
     from features.models.multimodal_fusion import MultiModalFusionModel, get_default_vocab
     from features.losses import ContrastiveLoss
@@ -427,13 +539,20 @@ def main():
     use_fixed_pairs = False
     if args.synthetic:
         from features.dataset import PairwiseSyntheticDataset
+
         syn_path = args.synthetic_file or os.path.join(PROJECT_ROOT, "data", "synthetic_pairs.json")
         log.info("使用合成数据: %s", syn_path)
         dataset = PairwiseSyntheticDataset(syn_path, num_pairs=args.num_pairs, seed=seed)
     else:
         from features.dataset import PairwiseFunctionDataset
+
         use_disk_cache = not args.no_disk_cache
-        log.info("初始化 PairwiseFunctionDataset: index=%s cache_dir=%s use_disk_cache=%s", index_path, cache_dir, use_disk_cache)
+        log.info(
+            "初始化 PairwiseFunctionDataset: index=%s cache_dir=%s use_disk_cache=%s",
+            index_path,
+            cache_dir,
+            use_disk_cache,
+        )
         lazy_reuse_fp = (num_workers == 0) and (not args.no_precomputed_lazy_reuse_fp)
         use_fixed_pairs = (
             bool(args.precomputed_features)
@@ -547,6 +666,7 @@ def main():
                 pass
         try:
             from torch.utils.tensorboard import SummaryWriter
+
             os.makedirs(tb_dir, exist_ok=True)
             tb_writer = SummaryWriter(tb_dir)
             tb_writer.add_hparams({"seed": seed}, {})
@@ -560,7 +680,10 @@ def main():
         if wandb_run is not None:
             try:
                 import wandb
-                wandb.log({"train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc}, step=epoch)
+
+                wandb.log(
+                    {"train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc}, step=epoch
+                )
             except ImportError:
                 pass
         rdir = args.retrieval_val_dir
@@ -584,7 +707,11 @@ def main():
                 lib_mm = _json.load(f)
             with open(qry_p, encoding="utf-8") as f:
                 q_mm = _json.load(f)
-            if not isinstance(gt_full, dict) or not isinstance(lib_mm, dict) or not isinstance(q_mm, dict):
+            if (
+                not isinstance(gt_full, dict)
+                or not isinstance(lib_mm, dict)
+                or not isinstance(q_mm, dict)
+            ):
                 return
             sub = max(0, int(args.retrieval_val_subsample))
             if sub > 0:
@@ -632,6 +759,7 @@ def main():
         "max_graph_nodes": int(args.max_graph_nodes),
         "max_seq_len": int(args.max_seq_len),
     }
+
     def _unwrap_underlying_dataset(subset_ds):
         d = subset_ds
         while hasattr(d, "dataset"):
@@ -698,6 +826,7 @@ def main():
     )
     # 写入实验 metadata
     from experiment_meta import save_metadata
+
     save_metadata(save_path, args, extra=ckpt_meta)
     print(f"最佳模型已保存至 {save_path}")
 

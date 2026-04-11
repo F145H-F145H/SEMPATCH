@@ -3,6 +3,7 @@
 SAFE 对比学习训练脚本：_SafeEncoder + 成对对比学习。
 支持目标校验：训练后若未达到指定 Recall 指标，自动扩样重训。
 """
+
 import argparse
 import json
 import random
@@ -137,6 +138,7 @@ def _run_validation(
     复用 build_embeddings_db._process_features_file 与 TwoStagePipeline。
     """
     import importlib.util
+
     spec = importlib.util.spec_from_file_location(
         "build_emb_db",
         os.path.join(PROJECT_ROOT, "scripts", "build_embeddings_db.py"),
@@ -217,7 +219,9 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=10, help="训练 epoch 数")
     parser.add_argument("--batch-size", type=int, default=16, help="batch size")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker 数（默认 0，降低 OOM 风险）")
+    parser.add_argument(
+        "--num-workers", type=int, default=0, help="DataLoader worker 数（默认 0，降低 OOM 风险）"
+    )
     parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
     parser.add_argument("--save-path", default=None, help="模型保存路径")
     parser.add_argument("--cache-dir", default=None, help="特征缓存目录")
@@ -270,16 +274,33 @@ def main() -> None:
         help="粗筛 Top-K（与 eval_two_stage 一致）",
     )
     parser.add_argument("--val-batch-size", type=int, default=128, help="验证 query 批量大小")
-    parser.add_argument("--val-rerank-batch-size", type=int, default=1024, help="验证精排 batch 大小（候选 forward）")
-    parser.add_argument("--val-subsample", type=int, default=0, help="验证抽样 query 数（0 表示不抽样）")
-    parser.add_argument("--val-rerank-k", type=int, default=0, help="验证时精排只取前 K 个候选（0 表示用 coarse_k）")
-    parser.add_argument("--max-temp-mb", type=int, default=128, help="训练/验证临时目录最大总大小（MB）")
-    parser.add_argument("--temp-dir", default=None, help="训练/验证临时目录（默认 output/tmp/train_safe）")
+    parser.add_argument(
+        "--val-rerank-batch-size",
+        type=int,
+        default=1024,
+        help="验证精排 batch 大小（候选 forward）",
+    )
+    parser.add_argument(
+        "--val-subsample", type=int, default=0, help="验证抽样 query 数（0 表示不抽样）"
+    )
+    parser.add_argument(
+        "--val-rerank-k", type=int, default=0, help="验证时精排只取前 K 个候选（0 表示用 coarse_k）"
+    )
+    parser.add_argument(
+        "--max-temp-mb", type=int, default=128, help="训练/验证临时目录最大总大小（MB）"
+    )
+    parser.add_argument(
+        "--temp-dir", default=None, help="训练/验证临时目录（默认 output/tmp/train_safe）"
+    )
     parser.add_argument("--max-log-mb", type=int, default=32, help="单个日志文件最大大小（MB）")
     parser.add_argument("--log-backups", type=int, default=5, help="日志滚动备份份数")
     parser.add_argument("--log-level", default="INFO", help="日志级别（DEBUG/INFO/WARNING/ERROR）")
-    parser.add_argument("--max-tb-mb", type=int, default=128, help="TensorBoard 根目录最大总大小（MB）")
-    parser.add_argument("--tb-keep-runs", type=int, default=5, help="TensorBoard 仅保留最近 N 个 run 目录")
+    parser.add_argument(
+        "--max-tb-mb", type=int, default=128, help="TensorBoard 根目录最大总大小（MB）"
+    )
+    parser.add_argument(
+        "--tb-keep-runs", type=int, default=5, help="TensorBoard 仅保留最近 N 个 run 目录"
+    )
     parser.add_argument(
         "--no-progress-bar",
         action="store_true",
@@ -295,6 +316,7 @@ def main() -> None:
 
     seed = args.seed
     from experiment_meta import set_deterministic
+
     set_deterministic(seed)
 
     default_save = os.path.join(PROJECT_ROOT, "output", "safe_best_model.pt")
@@ -306,6 +328,13 @@ def main() -> None:
     cache_dir = args.cache_dir or default_cache
     index_path = args.index_file or default_index
     data_dir = args.data_dir or default_data_dir
+
+    # 自动发现 .training.jsonl（未指定 --precomputed-features 时）
+    if not args.precomputed_features:
+        inferred = os.path.splitext(index_path)[0] + ".training.jsonl"
+        if os.path.isfile(inferred):
+            print(f"自动发现训练特征文件: {inferred}")
+            args.precomputed_features = inferred
 
     _setup_rotating_logging(
         log_dir=os.path.join(PROJECT_ROOT, "output", "logs"),
@@ -321,7 +350,11 @@ def main() -> None:
         library_features = os.path.join(data_dir, "library_features.json")
         query_features = os.path.join(data_dir, "query_features.json")
         ground_truth = os.path.join(data_dir, "ground_truth.json")
-        for p, name in [(library_features, "library_features"), (query_features, "query_features"), (ground_truth, "ground_truth")]:
+        for p, name in [
+            (library_features, "library_features"),
+            (query_features, "query_features"),
+            (ground_truth, "ground_truth"),
+        ]:
             if not os.path.isfile(p):
                 print(f"错误: 启用校验需存在 {name}: {p}", file=sys.stderr)
                 sys.exit(1)
@@ -343,6 +376,7 @@ def main() -> None:
             vocab = collect_vocab_from_features_file(vpath)
     else:
         from features.models.multimodal_fusion import get_default_vocab
+
         log.info("使用默认多模态词表（未指定 --vocab-from-features）")
         vocab = get_default_vocab()
     vocab_size = max(len(vocab), 256)
@@ -353,7 +387,7 @@ def main() -> None:
     from features.trainer import Trainer
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_pin_memory = (device.type == "cuda")
+    use_pin_memory = device.type == "cuda"
     num_workers = max(0, int(args.num_workers))
     num_pairs = args.num_pairs
     epochs = args.epochs
@@ -378,10 +412,14 @@ def main() -> None:
 
         if args.synthetic:
             from features.dataset import PairwiseSyntheticDataset
-            syn_path = args.synthetic_file or os.path.join(PROJECT_ROOT, "data", "synthetic_pairs.json")
+
+            syn_path = args.synthetic_file or os.path.join(
+                PROJECT_ROOT, "data", "synthetic_pairs.json"
+            )
             dataset = PairwiseSyntheticDataset(syn_path, num_pairs=num_pairs, seed=seed)
         else:
             from features.dataset import PairwiseFunctionDataset
+
             use_disk_cache = not args.no_disk_cache
             log.info("正在初始化 PairwiseFunctionDataset（索引加载 / JSONL 侧车建索引可能较慢）…")
             dataset = PairwiseFunctionDataset(
@@ -442,13 +480,16 @@ def main() -> None:
                 tb_dir = os.path.join(PROJECT_ROOT, "output", "tensorboard", f"safe_{timestamp}")
             try:
                 from torch.utils.tensorboard import SummaryWriter
+
                 # TensorBoard 保留策略：只保留近期 run，并限制根目录总大小
                 try:
                     from utils.retention import enforce_dir_size_limit, enforce_subdir_retention
 
                     tb_root = os.path.join(PROJECT_ROOT, "output", "tensorboard")
                     os.makedirs(tb_root, exist_ok=True)
-                    enforce_subdir_retention(tb_root, keep_recent_dirs=args.tb_keep_runs, name_prefix="safe_")
+                    enforce_subdir_retention(
+                        tb_root, keep_recent_dirs=args.tb_keep_runs, name_prefix="safe_"
+                    )
                     enforce_dir_size_limit(
                         tb_root,
                         max_total_bytes=int(args.max_tb_mb) * 1024 * 1024,
@@ -480,10 +521,13 @@ def main() -> None:
             progress_bar=show_progress,
             log_batches_every=max(1, int(args.progress_log_every)),
         )
-        safe_save_model(model, vocab, save_path, embed_dim=args.embed_dim, output_dim=args.output_dim)
+        safe_save_model(
+            model, vocab, save_path, embed_dim=args.embed_dim, output_dim=args.output_dim
+        )
 
         # 写入实验 metadata
         from experiment_meta import save_metadata
+
         save_metadata(save_path, args)
 
         if args.skip_validation or args.synthetic:
@@ -511,7 +555,9 @@ def main() -> None:
             max_temp_mb=args.max_temp_mb,
         )
 
-        print(f"校验 retry={retry + 1}: coarse_recall={coarse_recall:.4f}, recall_at_1={recall_at_1:.4f}")
+        print(
+            f"校验 retry={retry + 1}: coarse_recall={coarse_recall:.4f}, recall_at_1={recall_at_1:.4f}"
+        )
 
         if coarse_recall >= args.target_coarse_recall and recall_at_1 >= args.target_recall_at_1:
             print(f"达标，最佳模型已保存至 {save_path}")
