@@ -12,16 +12,143 @@
 """
 
 import argparse
+import gc
 import json
+import logging
 import os
 import sys
+import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
+log = logging.getLogger("build_embeddings_db")
+
 _BINARY_EXTS = (".elf", ".bin", ".so")
 _DEFAULT_TEMP_DIR = os.path.join(PROJECT_ROOT, "output", "binkit_emb_temp")
 
+
+# ---------------------------------------------------------------------------
+# 流式 JSON 对象解析器：逐条 yield (key, value)，不将整个文件加载到内存
+# ---------------------------------------------------------------------------
+
+def _iter_json_object_records(fp):
+    """
+    流式解析 JSON 对象 {key: value, ...}，逐条 yield (key, value)。
+    不将整个文件加载到内存，避免大 features 文件导致 OOM。
+    支持 value 为任意合法 JSON 类型（对象、数组、字符串、数字等）。
+    """
+    raw = fp.read()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+
+    n = len(raw)
+    i = 0
+
+    while i < n and raw[i] in b' \t\r\n':
+        i += 1
+    if i >= n or raw[i] != 123:  # '{'
+        return
+    i += 1
+
+    def skip_string(s, pos):
+        pos += 1
+        while pos < len(s):
+            if s[pos] == 92:  # '\'
+                pos += 2
+                continue
+            if s[pos] == 34:  # '"'
+                return pos + 1
+            pos += 1
+        return len(s)
+
+    def skip_value(s, pos):
+        while pos < len(s) and s[pos] in b' \t\r\n':
+            pos += 1
+        if pos >= len(s):
+            return pos
+        c = s[pos]
+        if c == 34:  # '"'
+            return skip_string(s, pos)
+        if c == 91:  # '['
+            pos += 1
+            depth = 1
+            while pos < len(s) and depth > 0:
+                if s[pos] == 34:
+                    pos = skip_string(s, pos)
+                    continue
+                if s[pos] == 91:
+                    depth += 1
+                elif s[pos] == 93:
+                    depth -= 1
+                pos += 1
+            return pos
+        if c == 123:  # '{'
+            pos += 1
+            depth = 1
+            while pos < len(s) and depth > 0:
+                if s[pos] == 34:
+                    pos = skip_string(s, pos)
+                    continue
+                if s[pos] == 123:
+                    depth += 1
+                elif s[pos] == 125:
+                    depth -= 1
+                pos += 1
+            return pos
+        if c in b'-0123456789tfn':  # number / true / false / null
+            while pos < len(s) and s[pos] not in b',} \t\r\n':
+                pos += 1
+            return pos
+        return pos
+
+    while i < n:
+        while i < n and raw[i] in b' \t\r\n':
+            i += 1
+        if i >= n:
+            break
+        if raw[i] == 125:  # '}'
+            break
+        if raw[i] != 34:  # '"'
+            break
+        key_start = i
+        key_end = skip_string(raw, i)
+        try:
+            key = json.loads(raw[key_start:key_end].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            break
+        i = key_end
+
+        while i < n and raw[i] in b' \t\r\n':
+            i += 1
+        if i >= n or raw[i] != 58:  # ':'
+            break
+        i += 1
+
+        while i < n and raw[i] in b' \t\r\n':
+            i += 1
+        if i >= n:
+            break
+        val_start = i
+        val_end = skip_value(raw, i)
+        try:
+            value = json.loads(raw[val_start:val_end].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            break
+        i = val_end
+
+        yield key, value
+        del value
+
+        while i < n and raw[i] in b' \t\r\n':
+            i += 1
+        if i < n and raw[i] == 44:  # ','
+            i += 1
+
+
+# ---------------------------------------------------------------------------
+# 特征提取辅助
+# ---------------------------------------------------------------------------
 
 def _extract_pcode_tokens_from_lsir_func(lsir_func: dict) -> list[str]:
     """从单个规范化的 lsir 函数节点提取 pcode token 列表。"""
@@ -78,11 +205,6 @@ def _extract_training_features_from_raw(
     - MultiModal 所需完整 multimodal features (graph + sequence + acfg + dfg)
     返回训练用记录列表，每条含 function_id / multimodal / safe_tokens。
     function_id 格式与 dataset._function_id 一致: {binary_rel}|0x{entry_lower}
-
-    性能说明：
-    - build_lsir(include_dfg=True)：DFG 是训练必须的（MultiModalFusionModel 的 DFG 分支）
-    - 单次 build_lsir 处理全部函数（逐函数调用反而因重复 normalize 更慢）
-    - safe_tokens 从 normalize 后的 raw 直接提取（不依赖 build_lsir 输出，零额外开销）
     """
     from utils.pcode_normalizer import normalize_lsir_raw
     from utils.ir_builder import build_lsir
@@ -96,12 +218,10 @@ def _extract_training_features_from_raw(
     raw = normalize_lsir_raw(raw_data)
     funcs_raw = raw.get("functions", [])
 
-    # SAFE tokens：normalize 后直接从 basic_blocks/instructions 提取（轻量，不依赖 build_lsir）
     all_safe_tokens: list[list[str]] = []
     for fn in funcs_raw:
         all_safe_tokens.append(_extract_pcode_tokens_from_lsir_func(fn))
 
-    # MultiModal features：单次 build_lsir 处理全部函数（含 DFG）
     lsir = build_lsir(raw, include_cfg=True, include_dfg=True)
 
     records: list[dict] = []
@@ -145,7 +265,6 @@ def _process_single_lsir(
         print(f"过滤后保留 {len(funcs_raw)} 个函数")
 
     if model_type == "safe":
-        # 快速路径：只提取 pcode tokens，跳过 graph/acfg/fuse
         features = {"functions": _extract_pcode_tokens_from_raw(raw_data)}
         if filter_substr:
             features["functions"] = [
@@ -155,7 +274,6 @@ def _process_single_lsir(
             ]
         return embed_batch_safe(features, model_path=model_path)
 
-    # sempatch / jtrans_style 需要完整特征提取
     from utils.ir_builder import build_lsir
     from utils.pcode_normalizer import normalize_lsir_raw
     from utils.feature_extractors import (
@@ -202,15 +320,23 @@ def _collect_binaries_from_index(index_path: str) -> list[str]:
     return binaries
 
 
+# ---------------------------------------------------------------------------
+# 核心：流式处理 features 文件 → 嵌入
+# ---------------------------------------------------------------------------
+
 def _process_features_file(
     features_path: str,
     model_path: str | None = None,
     safe_batch_size: int = 1024,
     embed_kind: str = "safe",
+    output_path: str | None = None,
 ) -> list:
     """
     从 library_features.json 格式读取特征并计算基线嵌入，返回 [{function_id, vector}]。
     embed_kind: safe | jtrans_style；model_path 为对应基线检查点，未指定则用随机初始化。
+
+    内存优化：流式读取 JSON 对象，不将整个文件加载到内存。分块嵌入并显式释放中间数据。
+    进度报告：每 10 秒打印一次进度，每个批次完成时打印摘要。
     """
     from features.baselines.jtrans_style import embed_batch_jtrans_style
     from features.baselines.safe import embed_batch_safe
@@ -219,34 +345,107 @@ def _process_features_file(
     batch = max(1, int(safe_batch_size))
     out: list[dict] = []
     chunk: list[dict] = []
+    vocab: dict[str, int] = {"[PAD]": 0, "[UNK]": 1}
 
-    def _flush_chunk() -> None:
-        nonlocal chunk
+    n_records = 0
+    n_flushes = 0
+    t_start = time.monotonic()
+    last_log_t = t_start
+    LOG_INTERVAL = 10.0
+
+    def _log_progress(force=False):
+        nonlocal last_log_t
+        now = time.monotonic()
+        if not force and (now - last_log_t) < LOG_INTERVAL:
+            return
+        elapsed = now - t_start
+        speed = n_records / elapsed if elapsed > 0 else 0
+        mem_mb = 0
+        try:
+            import resource
+            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        except Exception:
+            pass
+        log.info(
+            "嵌入进度: %d 条记录, %d 批已完成, 词表 %d tokens, "
+            "速度 %.0f 条/s, 耗时 %.0fs, 内存 %.0fMB",
+            n_records, n_flushes, len(vocab), speed, elapsed, mem_mb,
+        )
+        last_log_t = now
+
+    def _update_vocab(mm):
+        seq = mm.get("sequence") or {}
+        for t in seq.get("pcode_tokens") or []:
+            if t and t not in vocab:
+                vocab[t] = len(vocab)
+        graph = mm.get("graph") or {}
+        for nf in graph.get("node_features") or []:
+            opcodes = nf if isinstance(nf, list) else (nf.get("pcode_opcodes") or [])
+            for op in opcodes:
+                if op and op not in vocab:
+                    vocab[op] = len(vocab)
+
+    def _flush_chunk():
+        nonlocal chunk, n_flushes
         if not chunk:
             return
+        n_flushes += 1
+        chunk_size = len(chunk)
+        t_flush = time.monotonic()
         if embed_kind == "jtrans_style":
             result = embed_batch_jtrans_style({"functions": chunk}, model_path=model_path)
         else:
             result = embed_batch_safe({"functions": chunk}, model_path=model_path)
+        flush_elapsed = time.monotonic() - t_flush
         out.extend({"function_id": item["name"], "vector": item["vector"]} for item in result)
+        log.info(
+            "  批 %d: %d 条嵌入完成 (%.1fs), 累计 %d",
+            n_flushes, chunk_size, flush_elapsed, len(out),
+        )
         chunk = []
+        gc.collect()
 
-    if is_jsonl_sidecar_path(features_path):
+    is_jsonl = is_jsonl_sidecar_path(features_path)
+
+    if is_jsonl:
         records_iter = iter_jsonl_sidecar(features_path)
+        log.info("开始处理 JSONL 特征文件: %s (safe=%s)", features_path, embed_kind)
     else:
-        with open(features_path, encoding="utf-8") as f:
-            features_dict = json.load(f)
-        if not isinstance(features_dict, dict):
-            raise ValueError("特征文件格式应为 {function_id: multimodal_dict}")
-        records_iter = features_dict.items()
+        file_size_mb = os.path.getsize(features_path) / (1024 * 1024)
+        log.info(
+            "开始流式处理 JSON 特征文件: %s (%.1f MB, safe=%s)",
+            features_path, file_size_mb, embed_kind,
+        )
+        fp = open(features_path, "rb")
+        records_iter = _iter_json_object_records(fp)
 
-    for fid, mm in records_iter:
-        if not isinstance(fid, str) or not isinstance(mm, dict):
-            continue
-        chunk.append({"name": fid, "features": {"multimodal": mm}})
-        if len(chunk) >= batch:
-            _flush_chunk()
-    _flush_chunk()
+    try:
+        for fid, mm in records_iter:
+            if not isinstance(fid, str) or not isinstance(mm, dict):
+                continue
+            n_records += 1
+            _update_vocab(mm)
+            chunk.append({"name": fid, "features": {"multimodal": mm}})
+            if len(chunk) >= batch:
+                _flush_chunk()
+                _log_progress()
+        _flush_chunk()
+        _log_progress(force=True)
+    finally:
+        if not is_jsonl:
+            try:
+                fp.close()
+            except Exception:
+                pass
+        gc.collect()
+
+    elapsed = time.monotonic() - t_start
+    speed = n_records / elapsed if elapsed > 0 else 0
+    log.info(
+        "嵌入完成: %d 条记录 → %d 个嵌入向量, 词表 %d tokens, "
+        "总耗时 %.1fs (%.0f 条/s)",
+        n_records, len(out), len(vocab), elapsed, speed,
+    )
     return out
 
 
@@ -264,6 +463,14 @@ def _collect_binaries_from_dir(input_dir: str) -> list[str]:
 
 
 def main() -> None:
+    # 配置日志：确保用户在终端看到进度输出，无需额外设置
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stderr)],
+    )
+
     parser = argparse.ArgumentParser(description="从 LSIR/lsir_raw 构建 embeddings 漏洞库")
     parser.add_argument(
         "input",
@@ -347,7 +554,6 @@ def main() -> None:
     if args.no_intermediate_save:
         args.intermediate_save = False
 
-    # 互斥：input | --input-dir | --index-file | --features-file 仅可指定其一
     modes = sum(
         [
             bool(args.input),
@@ -374,7 +580,7 @@ def main() -> None:
     if args.features_file:
         fe_path = os.path.abspath(args.features_file)
         if not os.path.isfile(fe_path):
-            print(f"错误: 特征文件不存在 {fe_path}", file=sys.stderr)
+            log.error("特征文件不存在 %s", fe_path)
             sys.exit(1)
         baseline_path = args.model_path if args.model in ("safe", "jtrans_style") else None
         fe_kind = args.model if args.model in ("safe", "jtrans_style") else "safe"
@@ -383,12 +589,61 @@ def main() -> None:
             model_path=baseline_path,
             safe_batch_size=args.safe_batch_size,
             embed_kind=fe_kind,
+            output_path=os.path.abspath(args.output),
         )
-        print(
-            f"从特征文件 {args.features_file} 构建 {len(all_embeddings)} 个嵌入 " f"（{fe_kind}）"
-        )
+
+        # --emit-training-features：从 features 文件流式生成 .training.jsonl
+        if args.emit_training_features:
+            from utils.precomputed_multimodal_io import (
+                is_jsonl_sidecar_path,
+                iter_jsonl_sidecar,
+            )
+
+            if args.training_features_output:
+                training_out_path = os.path.abspath(args.training_features_output)
+            else:
+                base, _ = os.path.splitext(os.path.abspath(args.output))
+                training_out_path = base + ".training.jsonl"
+            os.makedirs(os.path.dirname(training_out_path) or ".", exist_ok=True)
+
+            if is_jsonl_sidecar_path(fe_path):
+                src_iter = iter_jsonl_sidecar(fe_path)
+            else:
+                _fp = open(fe_path, "rb")
+                src_iter = _iter_json_object_records(_fp)
+
+            training_count = 0
+            t_emit = time.monotonic()
+            LOG_EVERY = 50000
+            log.info("开始生成训练特征 JSONL → %s", training_out_path)
+            try:
+                with open(training_out_path, "w", encoding="utf-8") as tfp:
+                    for fid, mm in src_iter:
+                        if not isinstance(fid, str) or not isinstance(mm, dict):
+                            continue
+                        seq = mm.get("sequence") or {}
+                        safe_tokens = seq.get("pcode_tokens") or []
+                        rec = {
+                            "function_id": fid,
+                            "multimodal": mm,
+                            "safe_tokens": safe_tokens,
+                        }
+                        tfp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        training_count += 1
+                        if training_count % LOG_EVERY == 0:
+                            elapsed = time.monotonic() - t_emit
+                            speed = training_count / elapsed if elapsed > 0 else 0
+                            log.info("  训练特征: %d 条 (%.0f 条/s)", training_count, speed)
+            finally:
+                if not is_jsonl_sidecar_path(fe_path):
+                    try:
+                        _fp.close()
+                    except Exception:
+                        pass
+            elapsed = time.monotonic() - t_emit
+            log.info("训练特征已写入 %s (%d 条, %.1fs)", training_out_path, training_count, elapsed)
+
     elif args.input:
-        # 单文件模式
         path = os.path.abspath(args.input)
         if not os.path.isfile(path):
             print(f"错误: 文件不存在 {path}", file=sys.stderr)
@@ -399,7 +654,6 @@ def main() -> None:
             data, args.model_path, args.filter, model_type=args.model
         )
     else:
-        # 批量模式：--input-dir 或 --index-file
         if args.index_file:
             idx_path = os.path.abspath(args.index_file)
             if not os.path.isfile(idx_path):
@@ -430,7 +684,6 @@ def main() -> None:
         out_dir = os.path.dirname(out_path) or "."
         os.makedirs(out_dir, exist_ok=True)
 
-        # 训练特征 JSONL 输出
         training_fp = None
         training_out_path = None
         training_count = 0
@@ -441,11 +694,9 @@ def main() -> None:
                 base, _ = os.path.splitext(out_path)
                 training_out_path = base + ".training.jsonl"
             os.makedirs(os.path.dirname(training_out_path) or ".", exist_ok=True)
-            # 追加模式（支持断点续跑）
             training_fp = open(training_out_path, "a", encoding="utf-8")
             print(f"训练特征将写入: {training_out_path} (JSONL, append)")
 
-        # 断点续跑：加载已有嵌入输出，并构建已完成 rel_path 集合（避免训练特征重复写入）
         processed_rels: set[str] = set()
         if args.resume and os.path.isfile(out_path):
             try:
@@ -489,12 +740,10 @@ def main() -> None:
                     print(f"  [{idx}/{len(binaries)}] ⚠ 无函数 {rel_path}", file=sys.stderr)
                     continue
 
-                # 训练特征提取（一次遍历：multimodal + safe_tokens）
                 t_feats = None
                 if training_fp is not None:
                     try:
                         t_feats = _extract_training_features_from_raw(lsir_raw, rel_path)
-                        # 批量写入 JSONL（减少 I/O 次数）
                         training_buf = (
                             "\n".join(json.dumps(rec, ensure_ascii=False) for rec in t_feats) + "\n"
                         )
@@ -508,7 +757,6 @@ def main() -> None:
                         )
                         t_feats = None
 
-                # 嵌入计算：t_feats 已存在时复用特征，避免重复 normalize+build_lsir
                 if t_feats is not None:
                     from features.baselines.jtrans_style import embed_batch_jtrans_style
                     from features.baselines.safe import embed_batch_safe
@@ -558,10 +806,8 @@ def main() -> None:
                         lsir_raw, args.model_path, args.filter, model_type=args.model
                     )
 
-                # 释放 lsir_raw（嵌入计算完成后不再需要）
                 del lsir_raw
 
-                # 定期释放 peek cache（避免累积持有大量 dict 引用）
                 if idx % 10 == 0:
                     try:
                         from utils._ghidra_helpers import clear_peek_cache
@@ -582,7 +828,6 @@ def main() -> None:
                     f"速度 {speed:.0f} fn/s | ETA {eta_sec/60:.1f}min"
                 )
 
-                # 每 N 个二进制保存一次中间结果
                 if args.intermediate_save and idx % args.intermediate_save_every == 0:
                     with open(out_path, "w", encoding="utf-8") as f:
                         json.dump({"functions": all_embeddings}, f, indent=2, ensure_ascii=False)
@@ -606,7 +851,7 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"functions": all_embeddings}, f, indent=2, ensure_ascii=False)
 
-    print(f"已写入 {out_path} ({len(all_embeddings)} 个函数嵌入)")
+    log.info("已写入 %s (%d 个函数嵌入)", out_path, len(all_embeddings))
 
 
 if __name__ == "__main__":

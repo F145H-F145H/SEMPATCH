@@ -175,7 +175,14 @@ def embed_batch(
     with torch.no_grad():
         # Process in chunks to bound memory
         chunk_size = 256
-        for start in range(0, len(valid_indices), chunk_size):
+        total_chunks = (len(valid_indices) + chunk_size - 1) // chunk_size
+        LOG_CHUNKS_EVERY = max(1, total_chunks // 10)
+        if total_chunks > 1:
+            logger.info(
+                "MultiModal 嵌入: %d 条记录, %d 批 (batch=%d)",
+                len(valid_indices), total_chunks, chunk_size,
+            )
+        for ci, start in enumerate(range(0, len(valid_indices), chunk_size)):
             chunk_idx = valid_indices[start : start + chunk_size]
             chunk_mm = [multimodals_list[i] for i in chunk_idx]
             try:
@@ -197,6 +204,12 @@ def embed_batch(
             except Exception:
                 for orig_i in chunk_idx:
                     embeddings[orig_i] = {"name": names[orig_i], "vector": zero_vec}
+            if total_chunks > 1 and (ci + 1) % LOG_CHUNKS_EVERY == 0:
+                done = min(start + chunk_size, len(valid_indices))
+                logger.info(
+                    "  MultiModal 批 %d/%d: %d/%d",
+                    ci + 1, total_chunks, done, len(valid_indices),
+                )
 
     # Fill any remaining slots (functions without multimodal)
     for i in range(len(funcs)):

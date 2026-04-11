@@ -8,7 +8,9 @@ SAFE 原文：汇编指令 → Instruction2Vec → 自注意力 RNN 聚合 → �
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -21,6 +23,7 @@ except ImportError:
 
 _OUTPUT_DIM = 128
 _EMBED_DIM = 64
+_log = logging.getLogger(__name__)
 
 
 def _collect_vocab_from_multimodal(mm: Dict[str, Any], vocab: Dict[str, int]) -> None:
@@ -51,18 +54,52 @@ def _collect_vocab(features: Dict[str, Any]) -> Dict[str, int]:
 def collect_vocab_from_features_file(features_path: str) -> Dict[str, int]:
     """
     从 library_features.json 格式（{function_id: multimodal_dict}）构建 vocab。
-    用于训练时统一 vocab，保证 tokenize 与模型 embed 层一致。
-
-    注意：大库会整文件 json.load，易 OOM；大侧车请改用 collect_vocab_from_features_jsonl。
+    使用流式 JSON 解析，不将整个文件加载到内存，避免大库 OOM。
     """
+    from utils.precomputed_multimodal_io import is_jsonl_sidecar_path, iter_jsonl_sidecar
+
     vocab: Dict[str, int] = {"[PAD]": 0, "[UNK]": 1}
-    with open(features_path, encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
+    n = 0
+    t0 = time.monotonic()
+    LOG_EVERY = 20000
+
+    if is_jsonl_sidecar_path(features_path):
+        _log.info("正在从 JSONL 流式构建词表: %s", features_path)
+        for _fid, mm in iter_jsonl_sidecar(features_path):
+            if isinstance(mm, dict):
+                _collect_vocab_from_multimodal(mm, vocab)
+            n += 1
+            if n % LOG_EVERY == 0:
+                elapsed = time.monotonic() - t0
+                _log.info("  词表扫描: %d 条, 词表 %d tokens (%.0fs)", n, len(vocab), elapsed)
+        elapsed = time.monotonic() - t0
+        _log.info("词表构建完成: %d 条扫描, %d tokens (%.1fs)", n, len(vocab), elapsed)
         return vocab
-    for mm in data.values():
-        if isinstance(mm, dict):
-            _collect_vocab_from_multimodal(mm, vocab)
+
+    # 流式解析 JSON 对象，避免 json.load OOM
+    try:
+        from scripts.sidechain.build_embeddings_db import _iter_json_object_records
+    except ImportError:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "..", "scripts", "sidechain"))
+        from build_embeddings_db import _iter_json_object_records  # type: ignore[no-redef]
+
+    file_size_mb = os.path.getsize(features_path) / (1024 * 1024)
+    _log.info("正在从 JSON 流式构建词表: %s (%.1f MB)", features_path, file_size_mb)
+    with open(features_path, "rb") as fp:
+        for _fid, mm in _iter_json_object_records(fp):
+            if isinstance(mm, dict):
+                _collect_vocab_from_multimodal(mm, vocab)
+            n += 1
+            if n % LOG_EVERY == 0:
+                elapsed = time.monotonic() - t0
+                speed = n / elapsed if elapsed > 0 else 0
+                _log.info(
+                    "  词表扫描: %d 条, 词表 %d tokens (%.0f 条/s, %.0fs)",
+                    n, len(vocab), speed, elapsed,
+                )
+    elapsed = time.monotonic() - t0
+    _log.info("词表构建完成: %d 条扫描, %d tokens (%.1fs)", n, len(vocab), elapsed)
     return vocab
 
 
@@ -74,9 +111,23 @@ def collect_vocab_from_features_jsonl(features_path: str) -> Dict[str, int]:
     vocab: Dict[str, int] = {"[PAD]": 0, "[UNK]": 1}
     from utils.precomputed_multimodal_io import iter_jsonl_sidecar
 
+    n = 0
+    t0 = time.monotonic()
+    LOG_EVERY = 20000
+    _log.info("正在从 JSONL 流式构建词表: %s", features_path)
     for _fid, mm in iter_jsonl_sidecar(features_path):
         if isinstance(mm, dict):
             _collect_vocab_from_multimodal(mm, vocab)
+        n += 1
+        if n % LOG_EVERY == 0:
+            elapsed = time.monotonic() - t0
+            speed = n / elapsed if elapsed > 0 else 0
+            _log.info(
+                "  词表扫描: %d 条, 词表 %d tokens (%.0f 条/s, %.0fs)",
+                n, len(vocab), speed, elapsed,
+            )
+    elapsed = time.monotonic() - t0
+    _log.info("词表构建完成: %d 条扫描, %d tokens (%.1fs)", n, len(vocab), elapsed)
     return vocab
 
 
@@ -217,7 +268,6 @@ class SafeEmbedder:
             self._model = model.to(self._device)
             self._vocab = vocab
         else:
-            # 未提供 model_path 时，调用方应避免在热路径中使用（因为 vocab 难以一致）
             import logging
 
             logging.getLogger(__name__).warning(
@@ -243,7 +293,6 @@ class SafeEmbedder:
         if not multimodals:
             return []
         if self._model is None:
-            # 无权重时退化为零向量（避免在验证/评估阶段产生随机噪声）
             return [[0.0] * _OUTPUT_DIM for _ in multimodals]
 
         out: List[List[float]] = []
@@ -285,20 +334,35 @@ def embed_batch_safe(
     out: List[Dict[str, Any]] = []
     max_len = 512
 
-    # Collect names and multimodal dicts for batched processing
     names = [item.get("name", "") for item in funcs]
     multimodals = [(item.get("features") or {}).get("multimodal") or {} for item in funcs]
 
     with torch.no_grad():
-        # Process in chunks to avoid excessive memory use
         chunk_size = 256
-        for start in range(0, len(multimodals), chunk_size):
+        total_chunks = (len(multimodals) + chunk_size - 1) // chunk_size
+        LOG_CHUNKS_EVERY = max(1, total_chunks // 10)
+        t0 = time.monotonic()
+        if total_chunks > 1:
+            _log.info(
+                "SAFE 嵌入: %d 条记录, %d 批 (batch=%d)",
+                len(multimodals), total_chunks, chunk_size,
+            )
+        for ci, start in enumerate(range(0, len(multimodals), chunk_size)):
             chunk_mm = multimodals[start : start + chunk_size]
             chunk_names = names[start : start + chunk_size]
             token_t, pad_mask_t = safe_tokenize_many(chunk_mm, vocab, max_len=max_len)
             vecs = model(token_t, pad_mask_t)  # (B, output_dim)
             for j, name in enumerate(chunk_names):
                 out.append({"name": name, "vector": vecs[j].tolist()})
+            if total_chunks > 1 and (ci + 1) % LOG_CHUNKS_EVERY == 0:
+                elapsed = time.monotonic() - t0
+                done = min(start + chunk_size, len(multimodals))
+                speed = done / elapsed if elapsed > 0 else 0
+                eta = (len(multimodals) - done) / speed if speed > 0 else 0
+                _log.info(
+                    "  SAFE 批 %d/%d: %d/%d (%.0f 条/s, ETA %.0fs)",
+                    ci + 1, total_chunks, done, len(multimodals), speed, eta,
+                )
     return out
 
 

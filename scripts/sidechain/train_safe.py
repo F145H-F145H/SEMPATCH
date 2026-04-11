@@ -180,10 +180,17 @@ def _run_validation(
     if not isinstance(ground_truth, dict):
         raise ValueError("ground_truth 应为 {query_id: [positive_id, ...]}")
 
-    with open(query_features_path, encoding="utf-8") as f:
-        query_features = json.load(f)
+    # 仅提取 query_features 的顶层 key（检查 qid 是否存在），不加载整个 value 到内存
+    try:
+        from scripts.sidechain.build_embeddings_db import _iter_json_object_records
 
-    valid_ids = [qid for qid in ground_truth if qid in query_features]
+        with open(query_features_path, "rb") as _qf:
+            query_feature_ids = {fid for fid, _ in _iter_json_object_records(_qf)}
+    except Exception:
+        with open(query_features_path, encoding="utf-8") as f:
+            query_feature_ids = set(json.load(f).keys())
+
+    valid_ids = [qid for qid in ground_truth if qid in query_feature_ids]
     if not valid_ids:
         return 0.0, 0.0
 
