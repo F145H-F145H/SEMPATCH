@@ -284,16 +284,21 @@ def embed_batch_safe(
 
     out: List[Dict[str, Any]] = []
     max_len = 512
+
+    # Collect names and multimodal dicts for batched processing
+    names = [item.get("name", "") for item in funcs]
+    multimodals = [(item.get("features") or {}).get("multimodal") or {} for item in funcs]
+
     with torch.no_grad():
-        for item in funcs:
-            name = item.get("name", "")
-            feats = item.get("features") or {}
-            mm = feats.get("multimodal") or {}
-            ids, pad_mask_list = safe_tokenize(mm, vocab, max_len=max_len)
-            token_t = torch.tensor([ids], dtype=torch.long)
-            pad_mask_t = torch.tensor([pad_mask_list], dtype=torch.bool)
-            vec = model(token_t, pad_mask_t)
-            out.append({"name": name, "vector": vec.squeeze(0).tolist()})
+        # Process in chunks to avoid excessive memory use
+        chunk_size = 256
+        for start in range(0, len(multimodals), chunk_size):
+            chunk_mm = multimodals[start : start + chunk_size]
+            chunk_names = names[start : start + chunk_size]
+            token_t, pad_mask_t = safe_tokenize_many(chunk_mm, vocab, max_len=max_len)
+            vecs = model(token_t, pad_mask_t)  # (B, output_dim)
+            for j, name in enumerate(chunk_names):
+                out.append({"name": name, "vector": vecs[j].tolist()})
     return out
 
 

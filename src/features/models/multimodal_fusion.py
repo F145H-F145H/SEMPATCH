@@ -102,7 +102,7 @@ class MultiModalFusionModel(nn.Module if TORCH_AVAILABLE else object):
         self.gnn_proj = nn.Linear(embed_dim, output_dim)
 
         if use_dfg:
-            self.dfg_node_embed = nn.Embedding(pcode_vocab_size, embed_dim, padding_idx=0)
+            self.dfg_node_embed = nn.Embedding(512, embed_dim, padding_idx=0)
             self.dfg_gnn_proj = nn.Linear(embed_dim, output_dim)
             self.graph_fuse = nn.Linear(output_dim * 2, output_dim)
         else:
@@ -296,7 +296,7 @@ def _tensorize_multimodal(
     dfg_ids: List[int] = []
     for x in dfg_nf[:max_dfg_nodes]:
         if isinstance(x, int):
-            dfg_ids.append(int(x))
+            dfg_ids.append(int(x) % 512)
         else:
             dfg_ids.append(0)
     if not dfg_ids:
@@ -316,6 +316,171 @@ def _tensorize_multimodal(
         dfg_node_t = dfg_node_t.to(device)
         dfg_edge_t = dfg_edge_t.to(device)
     return token_t, jump_t, node_t, edge_t, pad_mask, dfg_node_t, dfg_edge_t
+
+
+def tensorize_multimodal_many(
+    multimodals: List[Dict[str, Any]],
+    vocab: Dict[str, int],
+    device: Optional["torch.device"] = None,
+    max_seq_len: int = 512,
+    max_graph_nodes: int = 128,
+    max_dfg_nodes: int = 128,
+) -> Tuple[
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+    "torch.Tensor",
+]:
+    """批量将 multimodal 特征转为 batched tensor。
+
+    返回与 _tensorize_multimodal 相同的 7 元组，但第一维均为 B（批量大小）。
+    """
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch required")
+    if not multimodals:
+        raise ValueError("multimodals must be non-empty")
+
+    B = len(multimodals)
+
+    # -- Pass 1: compute per-item sizes --
+    per_item_tokens: List[List[int]] = []
+    per_item_jumps: List[List[int]] = []
+    per_item_nodes: List[List[int]] = []
+    per_item_edges: List[List[List[int]]] = []
+    per_item_dfg_nodes: List[List[int]] = []
+    per_item_dfg_edges: List[List[List[int]]] = []
+
+    for mm in multimodals:
+        seq = mm.get("sequence") or {}
+        graph = mm.get("graph") or {}
+        tokens = seq.get("pcode_tokens") or []
+        jump_mask = seq.get("jump_mask") or []
+        token_ids = [vocab.get(t, 1) for t in tokens[:max_seq_len]]
+        jump = list(jump_mask[:max_seq_len])
+        if not token_ids:
+            token_ids = [1]
+            jump = [0]
+        per_item_tokens.append(token_ids)
+        per_item_jumps.append(jump)
+
+        node_feats = graph.get("node_features") or []
+        nf_flat: List[int] = []
+        for nf in node_feats[:max_graph_nodes]:
+            opcodes = nf if isinstance(nf, list) else nf.get("pcode_opcodes", []) or []
+            idx = vocab.get(opcodes[0], 1) if opcodes else 0
+            nf_flat.append(idx)
+        if not nf_flat:
+            nf_flat = [0]
+        per_item_nodes.append(nf_flat)
+
+        edge_idx = graph.get("edge_index") or [[], []]
+        per_item_edges.append(edge_idx)
+
+        dfg = mm.get("dfg") or {}
+        dfg_nf = dfg.get("node_features") or []
+        dfg_ids: List[int] = []
+        for x in dfg_nf[:max_dfg_nodes]:
+            if isinstance(x, int):
+                dfg_ids.append(int(x) % 512)
+            else:
+                dfg_ids.append(0)
+        if not dfg_ids:
+            dfg_ids = [0]
+        per_item_dfg_nodes.append(dfg_ids)
+
+        dfg_e = dfg.get("edge_index") or [[], []]
+        per_item_dfg_edges.append(dfg_e)
+
+    # -- Pass 2: compute batch maxima --
+    max_actual_seq = max(len(t) for t in per_item_tokens)
+    max_actual_nodes = max(len(n) for n in per_item_nodes)
+    max_actual_edges = max(len(e[0]) for e in per_item_edges)
+    max_actual_dfg_nodes = max(len(d) for d in per_item_dfg_nodes)
+    max_actual_dfg_edges = max(len(e[0]) for e in per_item_dfg_edges)
+
+    seq_pad = max_actual_seq
+    node_pad = max_actual_nodes
+    dfg_node_pad = max_actual_dfg_nodes
+
+    # -- Pass 3: build batched tensors --
+    token_batch = torch.zeros(B, seq_pad, dtype=torch.long)
+    jump_batch = torch.zeros(B, seq_pad, dtype=torch.long)
+    pad_mask_batch = torch.ones(B, seq_pad, dtype=torch.bool)
+    node_batch = torch.zeros(B, node_pad, dtype=torch.long)
+    edge_src_list: List[torch.Tensor] = []
+    edge_dst_list: List[torch.Tensor] = []
+    dfg_node_batch = torch.zeros(B, dfg_node_pad, dtype=torch.long)
+    dfg_edge_src_list: List[torch.Tensor] = []
+    dfg_edge_dst_list: List[torch.Tensor] = []
+
+    for i in range(B):
+        # Sequence
+        tok = per_item_tokens[i]
+        jmp = per_item_jumps[i]
+        L = len(tok)
+        token_batch[i, :L] = torch.tensor(tok, dtype=torch.long)
+        jump_batch[i, :L] = torch.tensor(jmp, dtype=torch.long)
+        pad_mask_batch[i, :L] = False
+
+        # Graph nodes
+        nodes = per_item_nodes[i]
+        N = len(nodes)
+        node_batch[i, :N] = torch.tensor(nodes, dtype=torch.long)
+
+        # Graph edges: offset by i * node_pad
+        ei = per_item_edges[i]
+        if ei and ei[0]:
+            src = torch.tensor(ei[0], dtype=torch.long) + i * node_pad
+            dst = torch.tensor(ei[1], dtype=torch.long) + i * node_pad
+        else:
+            src = torch.zeros(0, dtype=torch.long)
+            dst = torch.zeros(0, dtype=torch.long)
+        edge_src_list.append(src)
+        edge_dst_list.append(dst)
+
+        # DFG nodes
+        dnodes = per_item_dfg_nodes[i]
+        DN = len(dnodes)
+        dfg_node_batch[i, :DN] = torch.tensor(dnodes, dtype=torch.long)
+
+        # DFG edges: offset by i * dfg_node_pad
+        dei = per_item_dfg_edges[i]
+        if dei and dei[0]:
+            dsrc = torch.tensor(dei[0], dtype=torch.long) + i * dfg_node_pad
+            ddst = torch.tensor(dei[1], dtype=torch.long) + i * dfg_node_pad
+        else:
+            dsrc = torch.zeros(0, dtype=torch.long)
+            ddst = torch.zeros(0, dtype=torch.long)
+        dfg_edge_src_list.append(dsrc)
+        dfg_edge_dst_list.append(ddst)
+
+    if max_actual_edges > 0:
+        edge_t = torch.stack(
+            [torch.cat(edge_src_list), torch.cat(edge_dst_list)]
+        )
+    else:
+        edge_t = torch.zeros(2, 0, dtype=torch.long)
+
+    if max_actual_dfg_edges > 0:
+        dfg_edge_t = torch.stack(
+            [torch.cat(dfg_edge_src_list), torch.cat(dfg_edge_dst_list)]
+        )
+    else:
+        dfg_edge_t = torch.zeros(2, 0, dtype=torch.long)
+
+    if device:
+        token_batch = token_batch.to(device)
+        jump_batch = jump_batch.to(device)
+        pad_mask_batch = pad_mask_batch.to(device)
+        node_batch = node_batch.to(device)
+        edge_t = edge_t.to(device)
+        dfg_node_batch = dfg_node_batch.to(device)
+        dfg_edge_t = dfg_edge_t.to(device)
+
+    return token_batch, jump_batch, node_batch, edge_t, pad_mask_batch, dfg_node_batch, dfg_edge_t
 
 
 def get_default_vocab() -> Dict[str, int]:

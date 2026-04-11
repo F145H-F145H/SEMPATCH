@@ -120,10 +120,10 @@ def embed_batch(
         import torch
         from features.models.multimodal_fusion import (
             MultiModalFusionModel,
-            _tensorize_multimodal,
             get_default_vocab,
             infer_use_dfg_from_state_dict,
             parse_multimodal_checkpoint,
+            tensorize_multimodal_many,
         )
 
         TORCH_AVAILABLE = True
@@ -133,6 +133,8 @@ def embed_batch(
     has_multimodal = any((item.get("features") or {}).get("multimodal") for item in funcs)
     if not TORCH_AVAILABLE or not has_multimodal:
         return _embed_baseline(features)
+
+    from features.models.multimodal_fusion import tensorize_multimodal_many
 
     vocab = _collect_vocab_from_features(features)
     vocab_size = max(len(vocab), 256)
@@ -158,21 +160,30 @@ def embed_batch(
             logger.warning("MultiModalFusion 权重加载失败，使用当前 batch 对应随机初始化: %s", e)
     model.eval()
 
-    embeddings: List[Dict[str, Any]] = []
+    # Separate functions with multimodal features from those without
+    names = [item.get("name", "") for item in funcs]
+    multimodals_list = [(item.get("features") or {}).get("multimodal") for item in funcs]
+
+    embeddings: List[Dict[str, Any]] = [{}] * len(funcs)  # placeholder
+    zero_vec = [0.0] * 128
+
+    # Indices that have multimodal features
+    valid_indices = [i for i, mm in enumerate(multimodals_list) if mm]
+    if not valid_indices:
+        return [{"name": n, "vector": zero_vec} for n in names]
+
     with torch.no_grad():
-        for item in funcs:
-            name = item.get("name", "")
-            feats = item.get("features") or {}
-            mm = feats.get("multimodal")
-            if not mm:
-                embeddings.append({"name": name, "vector": [0.0] * 128})
-                continue
+        # Process in chunks to bound memory
+        chunk_size = 256
+        for start in range(0, len(valid_indices), chunk_size):
+            chunk_idx = valid_indices[start : start + chunk_size]
+            chunk_mm = [multimodals_list[i] for i in chunk_idx]
             try:
-                t = _tensorize_multimodal(
-                    mm, vocab, device=None, max_seq_len=512, max_graph_nodes=128, max_dfg_nodes=128
+                batched = tensorize_multimodal_many(
+                    chunk_mm, vocab, device=None, max_seq_len=512, max_graph_nodes=128, max_dfg_nodes=128
                 )
-                token_t, jump_t, node_t, edge_t, pad_mask, dfg_nt, dfg_et = t
-                vec = model(
+                token_t, jump_t, node_t, edge_t, pad_mask, dfg_nt, dfg_et = batched
+                vecs = model(
                     token_t,
                     jump_t,
                     node_t,
@@ -180,10 +191,17 @@ def embed_batch(
                     padding_mask=pad_mask,
                     dfg_node_features=dfg_nt,
                     dfg_edge_index=dfg_et,
-                )
-                embeddings.append({"name": name, "vector": vec.numpy().tolist()})
+                )  # (B_chunk, output_dim)
+                for j, orig_i in enumerate(chunk_idx):
+                    embeddings[orig_i] = {"name": names[orig_i], "vector": vecs[j].numpy().tolist()}
             except Exception:
-                embeddings.append({"name": name, "vector": [0.0] * 128})
+                for orig_i in chunk_idx:
+                    embeddings[orig_i] = {"name": names[orig_i], "vector": zero_vec}
+
+    # Fill any remaining slots (functions without multimodal)
+    for i in range(len(funcs)):
+        if not embeddings[i]:
+            embeddings[i] = {"name": names[i], "vector": zero_vec}
 
     return embeddings
 
