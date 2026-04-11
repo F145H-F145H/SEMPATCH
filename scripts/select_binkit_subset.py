@@ -2,7 +2,7 @@
 """
 Phase 0: 从大量 BinKit ELF 中智能筛选训练子集。
 - 无需 Ghidra，纯文件名解析
-- 按 project_id 分组，优先保留多变体项目
+- 按 project_id 分组，强制覆盖 arch × compiler × opt 组合
 - 输出选中子集的 binary 索引 JSON
 """
 from __future__ import annotations
@@ -43,12 +43,115 @@ def scan_binaries(scan_root: str) -> list[dict]:
                 "arch": hints.arch,
                 "compiler": hints.compiler,
                 "opt": hints.opt,
-                "fingerprint": hints.fingerprint(),
             })
     return results
 
 
-def select_subset(all_binaries: list[dict], *, max_total: int = 800, min_variants: int = 2, max_variants: int = 5) -> list[dict]:
+def _pick_diverse_variants(items: list[dict], k: int) -> list[dict]:
+    """
+    从同一项目的多个变体中选 k 个，优先覆盖不同 (arch, compiler, opt) 组合。
+    策略：分层轮转 — 先保证 arch+compiler 覆盖，再按 opt 填充。
+    """
+    if len(items) <= k:
+        return list(items)
+
+    # 按 (arch, compiler, opt) 分桶
+    buckets: dict[tuple, list[dict]] = defaultdict(list)
+    for item in items:
+        key = (item.get("arch", "") or "", item.get("compiler", "") or "", item.get("opt", "") or "")
+        buckets[key].append(item)
+
+    chosen = []
+    already = set()
+
+    # Layer 1: 每个 (arch, compiler) 组合至少选一个（opt 任意）
+    # 关键：先按 compiler 分组，确保 gcc/clang 交替分配
+    seen_ac = set()
+    # 构造 (arch, compiler) → 第一个可用桶的映射
+    ac_to_keys: dict[tuple, list[tuple]] = defaultdict(list)
+    for key in sorted(buckets.keys()):
+        ac = (key[0], key[1])
+        if ac[0] and ac[1]:
+            ac_to_keys[ac].append(key)
+
+    # 按 compiler 交替、再按 arch 排序，保证均匀覆盖
+    compilers = sorted(set(ac[1] for ac in ac_to_keys))
+    archs = sorted(set(ac[0] for ac in ac_to_keys))
+    ordered_acs = []
+    for arch in archs:
+        for cc in compilers:
+            ac = (arch, cc)
+            if ac in ac_to_keys:
+                ordered_acs.append(ac)
+
+    for ac in ordered_acs:
+        key = ac_to_keys[ac][0]
+        c = buckets[key][0]
+        if id(c) not in already:
+            chosen.append(c)
+            already.add(id(c))
+            seen_ac.add(ac)
+
+    # Layer 2: 补充含未知维度的桶
+    for key in sorted(buckets.keys()):
+        ac = (key[0], key[1])
+        if ac not in seen_ac:
+            c = buckets[key][0]
+            if id(c) not in already:
+                chosen.append(c)
+                already.add(id(c))
+                seen_ac.add(ac)
+
+    # Layer 3: 轮转填充剩余配额 — 按 compiler → arch → opt 轮转
+    remaining_slots = k - len(chosen)
+    if remaining_slots <= 0:
+        return chosen[:k]
+
+    opt_order = {"o0": 0, "o1": 1, "o2": 2, "o3": 3, "ofast": 4, "os": 5}
+    opts = sorted(set(k[2] for k in buckets), key=lambda x: opt_order.get(x, 99))
+
+    # 构造轮转队列：先 compiler 交替，再 arch，再 opt
+    queue = []
+    for cc in compilers:
+        for arch in archs:
+            for opt in opts:
+                key = (arch, cc, opt)
+                if key in buckets:
+                    queue.append(key)
+    # 补充未知维度
+    for key in sorted(buckets.keys()):
+        if key not in queue:
+            queue.append(key)
+
+    taken = defaultdict(int)
+    # 已选的也要算进 taken
+    for c in chosen:
+        for key, bucket in buckets.items():
+            if c in bucket:
+                taken[key] += 1
+                break
+
+    idx = 0
+    while len(chosen) < k and idx < len(queue) * 10:
+        key = queue[idx % len(queue)]
+        if taken[key] < len(buckets[key]):
+            c = buckets[key][taken[key]]
+            if id(c) not in already:
+                chosen.append(c)
+                already.add(id(c))
+            taken[key] += 1
+        idx += 1
+
+    return chosen[:k]
+
+
+def select_subset(
+    all_binaries: list[dict],
+    *,
+    max_total: int = 800,
+    min_variants: int = 2,
+    max_variants: int = 5,
+) -> tuple[list[dict], dict]:
     """
     策略:
     1. 按 project_id 分组
@@ -81,7 +184,7 @@ def select_subset(all_binaries: list[dict], *, max_total: int = 800, min_variant
         items = groups[pid]
         if len(items) < min_variants:
             continue
-        # 每个项目选 max_variants 个，优先不同 fingerprint
+        # 每个项目选 max_variants 个，优先覆盖不同 (arch, compiler, opt) 组合
         chosen = _pick_diverse_variants(items, max_variants)
         remaining_slots = max_total - len(selected)
         chosen = chosen[:remaining_slots]
@@ -115,6 +218,18 @@ def select_subset(all_binaries: list[dict], *, max_total: int = 800, min_variant
     print(f"  编译器分布: {dict(compiler_counter)}")
     print(f"  优化级分布: {dict(opt_counter)}")
 
+    # 覆盖完整性检查
+    all_archs = set(b["arch"] for b in all_binaries if b["arch"])
+    all_compilers = set(b["compiler"] for b in all_binaries if b["compiler"])
+    selected_archs = set(arch_counter.keys())
+    selected_compilers = set(compiler_counter.keys())
+    if selected_archs != all_archs:
+        missing = all_archs - selected_archs
+        print(f"  ⚠ 未覆盖架构: {missing}")
+    if selected_compilers != all_compilers:
+        missing = all_compilers - selected_compilers
+        print(f"  ⚠ 未覆盖编译器: {missing}")
+
     return selected, {
         "total_binaries": len(selected),
         "multi_variant_projects": selected_projects,
@@ -125,33 +240,10 @@ def select_subset(all_binaries: list[dict], *, max_total: int = 800, min_variant
     }
 
 
-def _pick_diverse_variants(items: list[dict], k: int) -> list[dict]:
-    """从同一项目的多个变体中选 k 个，优先覆盖不同 fingerprint。"""
-    if len(items) <= k:
-        return list(items)
-    chosen = []
-    seen_fp = set()
-    # 第一轮：选不同 fingerprint
-    for item in items:
-        fp = item.get("fingerprint", "")
-        if fp and fp not in seen_fp:
-            chosen.append(item)
-            seen_fp.add(fp)
-            if len(chosen) >= k:
-                return chosen
-    # 第二轮：填充剩余
-    for item in items:
-        if item not in chosen:
-            chosen.append(item)
-            if len(chosen) >= k:
-                break
-    return chosen
-
-
 def main():
     parser = argparse.ArgumentParser(description="从大量 BinKit ELF 中智能筛选训练子集")
     parser.add_argument("--scan-root", required=True, help="BinKit 二进制根目录（递归扫描）")
-    parser.add_argument("-o", "--output", default="data/binkit_subset_index.json", help="输出子集索引")
+    parser.add_argument("-o", "--output", default="data/binkit_subset_index.json", help="输出子集索引 JSON")
     parser.add_argument("--max-total", type=int, default=800, help="最多选中二进制数")
     parser.add_argument("--min-variants", type=int, default=2, help="项目最少变体数（低于此仅作负对补充）")
     parser.add_argument("--max-variants", type=int, default=5, help="每项目最多保留变体数")
@@ -188,9 +280,10 @@ def main():
     proj_sorted = sorted(all_groups.items(), key=lambda x: -len(x[1]))
     print(f"\n  Top-20 最大项目 (正对数最多):")
     for pid, items in proj_sorted[:20]:
-        fps = set(x.get("fingerprint","") for x in items)
+        arch_set = set(b["arch"] for b in items if b["arch"])
+        compiler_set = set(b["compiler"] for b in items if b["compiler"])
         pairs = len(items) * (len(items)-1) // 2
-        print(f"    {pid}: {len(items)} 变体, {len(fps)} 独立配置, {pairs} 正对")
+        print(f"    {pid}: {len(items)} 变体, arch={arch_set}, compiler={compiler_set}, {pairs} 正对")
 
     if args.stats_only:
         return
@@ -213,6 +306,8 @@ def main():
 
     # 同时写入统计文件
     stats_path = out_path.replace(".json", "_stats.json")
+    if not stats_path.endswith("_stats.json"):
+        stats_path = out_path + "_stats.json"
     with open(stats_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
     print(f"  统计: {stats_path}")

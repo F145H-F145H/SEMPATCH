@@ -21,6 +21,8 @@ _ARCH_PATH_ALIASES: Tuple[Tuple[str, str], ...] = (
     ("i686", "x86"),
     ("aarch64", "aarch64"),
     ("arm64", "aarch64"),
+    ("arm_64", "aarch64"),
+    ("arm_32", "arm"),
     ("armhf", "arm"),
     ("armeb", "arm"),
     ("mipsel", "mipsel"),
