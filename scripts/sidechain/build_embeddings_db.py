@@ -32,123 +32,186 @@ _DEFAULT_TEMP_DIR = os.path.join(PROJECT_ROOT, "output", "binkit_emb_temp")
 # 流式 JSON 对象解析器：逐条 yield (key, value)，不将整个文件加载到内存
 # ---------------------------------------------------------------------------
 
+
 def _iter_json_object_records(fp):
     """
     流式解析 JSON 对象 {key: value, ...}，逐条 yield (key, value)。
-    不将整个文件加载到内存，避免大 features 文件导致 OOM。
+    使用分块读取，不将整个文件加载到内存（仅保留已解析前缀 + 1MB 缓冲）。
     支持 value 为任意合法 JSON 类型（对象、数组、字符串、数字等）。
     """
-    raw = fp.read()
-    if isinstance(raw, str):
-        raw = raw.encode("utf-8")
+    CHUNK = 1024 * 1024  # 1 MB
+    buf = b""
+    pos = 0
 
-    n = len(raw)
-    i = 0
+    def _refill(need=CHUNK):
+        nonlocal buf, pos
+        buf = buf[pos:]
+        pos = 0
+        while len(buf) < need:
+            chunk = fp.read(CHUNK)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            buf += chunk
 
-    while i < n and raw[i] in b' \t\r\n':
-        i += 1
-    if i >= n or raw[i] != 123:  # '{'
-        return
-    i += 1
+    def _ensure(n):
+        """Ensure at least n bytes available from pos; return False if EOF."""
+        if pos + n <= len(buf):
+            return True
+        _refill(pos + n)
+        return pos + n <= len(buf)
 
-    def skip_string(s, pos):
-        pos += 1
-        while pos < len(s):
-            if s[pos] == 92:  # '\'
-                pos += 2
+    def skip_string():
+        nonlocal pos
+        pos += 1  # opening '"'
+        while True:
+            if pos >= len(buf):
+                if not _ensure(1):
+                    return
+            c = buf[pos]
+            if c == 92:  # '\'
+                pos += 2  # skip escaped char
                 continue
-            if s[pos] == 34:  # '"'
-                return pos + 1
+            if c == 34:  # '"'
+                pos += 1
+                return
             pos += 1
-        return len(s)
 
-    def skip_value(s, pos):
-        while pos < len(s) and s[pos] in b' \t\r\n':
-            pos += 1
-        if pos >= len(s):
-            return pos
-        c = s[pos]
+    def skip_value():
+        nonlocal pos
+        while True:
+            if not _ensure(1):
+                return
+            c = buf[pos]
+            if c in b" \t\r\n":
+                pos += 1
+                continue
+            break
         if c == 34:  # '"'
-            return skip_string(s, pos)
+            skip_string()
+            return
         if c == 91:  # '['
             pos += 1
             depth = 1
-            while pos < len(s) and depth > 0:
-                if s[pos] == 34:
-                    pos = skip_string(s, pos)
+            while depth > 0:
+                if not _ensure(1):
+                    return
+                ch = buf[pos]
+                if ch == 34:
+                    skip_string()
                     continue
-                if s[pos] == 91:
+                if ch == 91:
                     depth += 1
-                elif s[pos] == 93:
+                elif ch == 93:
                     depth -= 1
                 pos += 1
-            return pos
+            return
         if c == 123:  # '{'
             pos += 1
             depth = 1
-            while pos < len(s) and depth > 0:
-                if s[pos] == 34:
-                    pos = skip_string(s, pos)
+            while depth > 0:
+                if not _ensure(1):
+                    return
+                ch = buf[pos]
+                if ch == 34:
+                    skip_string()
                     continue
-                if s[pos] == 123:
+                if ch == 123:
                     depth += 1
-                elif s[pos] == 125:
+                elif ch == 125:
                     depth -= 1
                 pos += 1
-            return pos
-        if c in b'-0123456789tfn':  # number / true / false / null
-            while pos < len(s) and s[pos] not in b',} \t\r\n':
+            return
+        if c in b"-0123456789tfn":  # number / true / false / null
+            while True:
+                if not _ensure(1):
+                    return
+                if buf[pos] in b",} \t\r\n":
+                    break
                 pos += 1
-            return pos
-        return pos
+            return
+        pos += 1
 
-    while i < n:
-        while i < n and raw[i] in b' \t\r\n':
-            i += 1
-        if i >= n:
+    # Read opening '{'
+    if not _ensure(1):
+        return
+    while pos < len(buf) and buf[pos] in b" \t\r\n":
+        pos += 1
+    if pos >= len(buf) or buf[pos] != 123:
+        return
+    pos += 1
+
+    while True:
+        # Skip whitespace
+        while True:
+            if not _ensure(1):
+                return
+            if buf[pos] not in b" \t\r\n":
+                break
+            pos += 1
+        if buf[pos] == 125:  # '}'
             break
-        if raw[i] == 125:  # '}'
+        if buf[pos] != 34:  # '"'
             break
-        if raw[i] != 34:  # '"'
-            break
-        key_start = i
-        key_end = skip_string(raw, i)
+
+        # Parse key
+        key_start = pos
+        skip_string()
+        key_end = pos
         try:
-            key = json.loads(raw[key_start:key_end].decode("utf-8"))
+            key = json.loads(buf[key_start:key_end].decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             break
-        i = key_end
 
-        while i < n and raw[i] in b' \t\r\n':
-            i += 1
-        if i >= n or raw[i] != 58:  # ':'
+        # Skip ':'
+        while True:
+            if not _ensure(1):
+                return
+            if buf[pos] not in b" \t\r\n":
+                break
+            pos += 1
+        if buf[pos] != 58:
             break
-        i += 1
+        pos += 1
 
-        while i < n and raw[i] in b' \t\r\n':
-            i += 1
-        if i >= n:
-            break
-        val_start = i
-        val_end = skip_value(raw, i)
+        # Parse value
+        while True:
+            if not _ensure(1):
+                return
+            if buf[pos] not in b" \t\r\n":
+                break
+            pos += 1
+        val_start = pos
+        skip_value()
+        val_end = pos
         try:
-            value = json.loads(raw[val_start:val_end].decode("utf-8"))
+            value = json.loads(buf[val_start:val_end].decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             break
-        i = val_end
 
         yield key, value
         del value
 
-        while i < n and raw[i] in b' \t\r\n':
-            i += 1
-        if i < n and raw[i] == 44:  # ','
-            i += 1
+        # Skip comma or end
+        while True:
+            if not _ensure(1):
+                return
+            if buf[pos] not in b" \t\r\n":
+                break
+            pos += 1
+        if buf[pos] == 44:  # ','
+            pos += 1
+        elif buf[pos] == 125:  # '}'
+            break
+        else:
+            break
 
 
 # ---------------------------------------------------------------------------
 # 特征提取辅助
 # ---------------------------------------------------------------------------
+
 
 def _extract_pcode_tokens_from_lsir_func(lsir_func: dict) -> list[str]:
     """从单个规范化的 lsir 函数节点提取 pcode token 列表。"""
@@ -206,14 +269,14 @@ def _extract_training_features_from_raw(
     返回训练用记录列表，每条含 function_id / multimodal / safe_tokens。
     function_id 格式与 dataset._function_id 一致: {binary_rel}|0x{entry_lower}
     """
-    from utils.pcode_normalizer import normalize_lsir_raw
-    from utils.ir_builder import build_lsir
     from utils.feature_extractors import (
         extract_acfg_features,
         extract_graph_features,
         extract_sequence_features,
         fuse_features,
     )
+    from utils.ir_builder import build_lsir
+    from utils.pcode_normalizer import normalize_lsir_raw
 
     raw = normalize_lsir_raw(raw_data)
     funcs_raw = raw.get("functions", [])
@@ -274,14 +337,14 @@ def _process_single_lsir(
             ]
         return embed_batch_safe(features, model_path=model_path)
 
-    from utils.ir_builder import build_lsir
-    from utils.pcode_normalizer import normalize_lsir_raw
     from utils.feature_extractors import (
         extract_acfg_features,
         extract_graph_features,
         extract_sequence_features,
         fuse_features,
     )
+    from utils.ir_builder import build_lsir
+    from utils.pcode_normalizer import normalize_lsir_raw
 
     raw = {"functions": funcs_raw}
     raw = normalize_lsir_raw(raw)
@@ -324,6 +387,7 @@ def _collect_binaries_from_index(index_path: str) -> list[str]:
 # 核心：流式处理 features 文件 → 嵌入
 # ---------------------------------------------------------------------------
 
+
 def _process_features_file(
     features_path: str,
     model_path: str | None = None,
@@ -363,13 +427,19 @@ def _process_features_file(
         mem_mb = 0
         try:
             import resource
+
             mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
         except Exception:
             pass
         log.info(
             "嵌入进度: %d 条记录, %d 批已完成, 词表 %d tokens, "
             "速度 %.0f 条/s, 耗时 %.0fs, 内存 %.0fMB",
-            n_records, n_flushes, len(vocab), speed, elapsed, mem_mb,
+            n_records,
+            n_flushes,
+            len(vocab),
+            speed,
+            elapsed,
+            mem_mb,
         )
         last_log_t = now
 
@@ -400,7 +470,10 @@ def _process_features_file(
         out.extend({"function_id": item["name"], "vector": item["vector"]} for item in result)
         log.info(
             "  批 %d: %d 条嵌入完成 (%.1fs), 累计 %d",
-            n_flushes, chunk_size, flush_elapsed, len(out),
+            n_flushes,
+            chunk_size,
+            flush_elapsed,
+            len(out),
         )
         chunk = []
         gc.collect()
@@ -414,7 +487,9 @@ def _process_features_file(
         file_size_mb = os.path.getsize(features_path) / (1024 * 1024)
         log.info(
             "开始流式处理 JSON 特征文件: %s (%.1f MB, safe=%s)",
-            features_path, file_size_mb, embed_kind,
+            features_path,
+            file_size_mb,
+            embed_kind,
         )
         fp = open(features_path, "rb")
         records_iter = _iter_json_object_records(fp)
@@ -442,9 +517,12 @@ def _process_features_file(
     elapsed = time.monotonic() - t_start
     speed = n_records / elapsed if elapsed > 0 else 0
     log.info(
-        "嵌入完成: %d 条记录 → %d 个嵌入向量, 词表 %d tokens, "
-        "总耗时 %.1fs (%.0f 条/s)",
-        n_records, len(out), len(vocab), elapsed, speed,
+        "嵌入完成: %d 条记录 → %d 个嵌入向量, 词表 %d tokens, " "总耗时 %.1fs (%.0f 条/s)",
+        n_records,
+        len(out),
+        len(vocab),
+        elapsed,
+        speed,
     )
     return out
 

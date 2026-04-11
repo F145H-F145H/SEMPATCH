@@ -5,12 +5,12 @@
 """
 
 import argparse
-import random
-import os
-import sys
 import logging
-from logging.handlers import RotatingFileHandler
+import os
+import random
+import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
@@ -87,7 +87,10 @@ def _make_step_fn(
     """构建训练步进函数：tensorize -> model -> loss + accuracy。"""
 
     def step_fn(batch, model, _loss_fn):
-        from features.models.multimodal_fusion import _tensorize_multimodal
+        from features.models.multimodal_fusion import (
+            _tensorize_multimodal,
+            tensorize_multimodal_many,
+        )
 
         f1_list = batch["feature1"] if isinstance(batch["feature1"], list) else [batch["feature1"]]
         f2_list = batch["feature2"] if isinstance(batch["feature2"], list) else [batch["feature2"]]
@@ -97,6 +100,40 @@ def _make_step_fn(
         else:
             labels = torch.tensor(labels, dtype=torch.float32, device=device)
 
+        # -- Primary: batched path using tensorize_multimodal_many --
+        try:
+            batch1 = tensorize_multimodal_many(
+                f1_list,
+                vocab,
+                device=device,
+                max_seq_len=max_seq_len,
+                max_graph_nodes=max_graph_nodes,
+                max_dfg_nodes=max_dfg_nodes,
+            )
+            batch2 = tensorize_multimodal_many(
+                f2_list,
+                vocab,
+                device=device,
+                max_seq_len=max_seq_len,
+                max_graph_nodes=max_graph_nodes,
+                max_dfg_nodes=max_dfg_nodes,
+            )
+            v1 = model(*batch1)
+            v2 = model(*batch2)
+            if v1.dim() == 1:
+                v1 = v1.unsqueeze(0)
+            if v2.dim() == 1:
+                v2 = v2.unsqueeze(0)
+            n = v1.size(0)
+            loss = _loss_fn(v1, v2, labels[:n])
+            cos_sim = torch.nn.functional.cosine_similarity(v1, v2, dim=1)
+            pred_sim = (cos_sim > threshold).float()
+            correct = (pred_sim == labels[:n]).float().sum().item()
+            return loss, int(correct), n
+        except Exception:
+            pass  # fall through to per-sample fallback
+
+        # -- Fallback: per-sample forward (error-resilient) --
         vec1_list = []
         vec2_list = []
         success_indices = []
@@ -147,13 +184,11 @@ def _make_step_fn(
                 continue
 
         if not vec1_list:
-            # 本 batch 全部样本 tensorize/forward 失败，跳过（count=0）
             return torch.tensor(0.0, device=device, requires_grad=True), 0, 0
 
         vec1 = torch.cat(vec1_list, dim=0)
         vec2 = torch.cat(vec2_list, dim=0)
         n = vec1.size(0)
-        # 用成功样本的原始索引对齐 labels，而非截取前 n 个（避免因中间样本失败导致标签错位）
         labels = labels[success_indices].to(device)
         loss = _loss_fn(vec1, vec2, labels)
         cos_sim = torch.nn.functional.cosine_similarity(vec1, vec2, dim=1)
@@ -314,6 +349,15 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=cfg.get("seed", 42), help="随机种子（可复现）")
     parser.add_argument(
+        "--use-amp", action="store_true", help="启用混合精度训练 (AMP)，降低显存占用"
+    )
+    parser.add_argument(
+        "--accumulation-steps",
+        type=int,
+        default=cfg.get("accumulation_steps", 1),
+        help="梯度累积步数（等效 batch_size = --batch-size * --accumulation-steps）",
+    )
+    parser.add_argument(
         "--pairing-mode",
         choices=("legacy", "binkit_refined"),
         default=cfg.get("pairing_mode", "legacy"),
@@ -465,8 +509,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_pin_memory = device.type == "cuda"
     num_workers = max(0, int(args.num_workers))
-    from features.models.multimodal_fusion import MultiModalFusionModel, get_default_vocab
     from features.losses import ContrastiveLoss
+    from features.models.multimodal_fusion import MultiModalFusionModel, get_default_vocab
     from features.trainer import Trainer
 
     if args.vocab_from_features and os.path.isfile(args.vocab_from_features):
@@ -755,6 +799,13 @@ def main():
             log.warning("检索验证跳过: %s", e)
         finally:
             model.train()
+            # Release retrieval data to free memory between validation runs
+            _retrieval_state.clear()
+            import gc as _gc
+
+            _gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     ckpt_meta = {
         "use_dfg": bool(args.use_dfg),
@@ -787,6 +838,8 @@ def main():
         step_fn=step_fn,
         tb_writer=tb_writer,
         checkpoint_meta=ckpt_meta,
+        use_amp=args.use_amp,
+        accumulation_steps=max(1, int(args.accumulation_steps)),
     )
     show_progress = not args.no_progress_bar
     if show_progress:

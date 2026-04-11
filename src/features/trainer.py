@@ -13,6 +13,7 @@ _log = logging.getLogger(__name__)
 
 try:
     import torch
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -38,6 +39,8 @@ class Trainer:
         similarity_threshold: float = 0.5,
         tb_writer: Optional[Any] = None,
         checkpoint_meta: Optional[Dict[str, Any]] = None,
+        use_amp: bool = False,
+        accumulation_steps: int = 1,
     ):
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch required for Trainer")
@@ -53,6 +56,12 @@ class Trainer:
         self.tb_writer = tb_writer
         self.checkpoint_meta = checkpoint_meta
         self.best_val_loss: Optional[float] = None
+        self.use_amp = use_amp and hasattr(device, "type") and device.type == "cuda"
+        self.accumulation_steps = max(1, int(accumulation_steps))
+        if self.use_amp:
+            self.scaler = torch.amp.GradScaler("cuda")
+        else:
+            self.scaler = None
 
     def _default_step(self, batch: Dict[str, Any], model: Any, loss_fn: Any) -> "torch.Tensor":
         """默认步进：需由外部注入 vocab 与 tensorize。此处为占位。"""
@@ -93,6 +102,14 @@ class Trainer:
         window_loss = 0.0
         window_count = 0
 
+        # AMP autocast context (nullcontext when AMP off or CPU)
+        if self.use_amp:
+            autocast_ctx = torch.amp.autocast("cuda")
+        else:
+            from contextlib import nullcontext as _nullcontext
+
+            autocast_ctx = _nullcontext()
+
         try:
             n_batches = len(loader) if hasattr(loader, "__len__") else None
             if epoch == 0 and phase == "train":
@@ -111,12 +128,13 @@ class Trainer:
                         t_after_data - t_epoch_loop,
                     )
                 t_before_step = time.perf_counter()
-                if self.step_fn is None:
-                    loss = self._default_step(batch, self.model, self.loss_fn)
-                    correct = 0
-                    count = 1
-                else:
-                    loss, correct, count = self.step_fn(batch, self.model, self.loss_fn)
+                with autocast_ctx:
+                    if self.step_fn is None:
+                        loss = self._default_step(batch, self.model, self.loss_fn)
+                        correct = 0
+                        count = 1
+                    else:
+                        loss, correct, count = self.step_fn(batch, self.model, self.loss_fn)
                 if batch_idx == 0 and log_first_batch_detail:
                     t_after_step = time.perf_counter()
                     _log.info(
@@ -132,9 +150,24 @@ class Trainer:
                 total_correct += correct
                 total_count += count
                 if training:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
+                    # Gradient accumulation: zero_grad at start of window
+                    if batch_idx == 0 or (batch_idx % self.accumulation_steps == 0):
+                        self.optimizer.zero_grad()
+                    # Scale loss by accumulation steps for correct gradient averaging
+                    scaled_loss = loss / self.accumulation_steps
+                    if self.scaler is not None:
+                        self.scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+                    # Step at accumulation boundary or last batch
+                    is_last_batch = (batch_idx + 1 == n_batches) if n_batches is not None else False
+                    if (batch_idx + 1) % self.accumulation_steps == 0 or is_last_batch:
+                        if self.scaler is not None:
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            self.optimizer.step()
+                        self.optimizer.zero_grad()
 
                 if batch_idx == 0 and training and count > 0 and log_first_batch_detail:
                     if torch.cuda.is_available():
@@ -156,7 +189,10 @@ class Trainer:
                         total_s = f"/{n_batches}" if n_batches is not None else ""
                         _log.info(
                             "  [%s] batch %s%s  window_avg_loss=%.4f",
-                            phase, batch_idx + 1, total_s, wavg,
+                            phase,
+                            batch_idx + 1,
+                            total_s,
+                            wavg,
                         )
                         since_log = 0
                         window_loss = 0.0
@@ -194,6 +230,7 @@ class Trainer:
         on_epoch_begin: 可选回调 (epoch_idx)，在每个 epoch 训练开始前调用（如刷新固定样本对）。
         """
         import os
+
         d = os.path.dirname(self.save_path)
         if d:
             os.makedirs(d, exist_ok=True)
@@ -209,7 +246,8 @@ class Trainer:
                 n_va = len(self.val_loader)
                 _log.info(
                     "[Trainer] 每 epoch: 训练 %s batch | 验证 %s batch",
-                    n_tr, n_va,
+                    n_tr,
+                    n_va,
                 )
             except TypeError:
                 _log.info("[Trainer] 进度条已启用（DataLoader 长度未知，无 batch 总数）")
@@ -243,7 +281,11 @@ class Trainer:
             val_loss, val_acc = self.validate(phase="val", **run_kw)
             _log.info(
                 "Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_acc=%.4f",
-                epoch + 1, num_epochs, train_loss, val_loss, val_acc,
+                epoch + 1,
+                num_epochs,
+                train_loss,
+                val_loss,
+                val_acc,
             )
             if self.tb_writer:
                 self.tb_writer.add_scalar("loss/train", train_loss, epoch)

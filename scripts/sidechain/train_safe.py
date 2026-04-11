@@ -6,14 +6,12 @@ SAFE 对比学习训练脚本：_SafeEncoder + 成对对比学习。
 
 import argparse
 import json
-import random
+import logging
 import os
 import sys
-import time
-import logging
-from typing import Optional
-from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
@@ -82,40 +80,40 @@ def _make_safe_step_fn(vocab, device, loss_fn, max_len=512, threshold=0.5):
         else:
             labels = torch.tensor(labels, dtype=torch.float32, device=device)
 
-        vec1_list = []
-        vec2_list = []
-        success_indices = []
+        # Tokenize all samples on CPU, then batch-transfer to GPU
+        all_ids1, all_pad1, all_ids2, all_pad2, success_indices = [], [], [], [], []
         for idx, (f1, f2) in enumerate(zip(f1_list, f2_list)):
             try:
                 ids1, pad1 = safe_tokenize(f1, vocab, max_len=max_len)
                 ids2, pad2 = safe_tokenize(f2, vocab, max_len=max_len)
-                t1 = torch.tensor([ids1], dtype=torch.long, device=device)
-                p1 = torch.tensor([pad1], dtype=torch.bool, device=device)
-                t2 = torch.tensor([ids2], dtype=torch.long, device=device)
-                p2 = torch.tensor([pad2], dtype=torch.bool, device=device)
-                v1 = model(t1, p1)
-                v2 = model(t2, p2)
-                if v1.dim() == 1:
-                    v1 = v1.unsqueeze(0)
-                if v2.dim() == 1:
-                    v2 = v2.unsqueeze(0)
-                vec1_list.append(v1)
-                vec2_list.append(v2)
+                all_ids1.append(ids1)
+                all_pad1.append(pad1)
+                all_ids2.append(ids2)
+                all_pad2.append(pad2)
                 success_indices.append(idx)
             except Exception:
                 continue
 
-        if not vec1_list:
-            # 本 batch 全部样本 forward 失败，跳过（count=0）
+        if not all_ids1:
             return torch.tensor(0.0, device=device, requires_grad=True), 0, 0
 
-        vec1 = torch.cat(vec1_list, dim=0)
-        vec2 = torch.cat(vec2_list, dim=0)
-        n = vec1.size(0)
-        # 用成功样本的原始索引对齐 labels，而非截取前 n 个（避免因中间样本失败导致标签错位）
+        # Stack into batch tensors and move to GPU once
+        t1 = torch.tensor(all_ids1, dtype=torch.long, device=device)
+        p1 = torch.tensor(all_pad1, dtype=torch.bool, device=device)
+        t2 = torch.tensor(all_ids2, dtype=torch.long, device=device)
+        p2 = torch.tensor(all_pad2, dtype=torch.bool, device=device)
+
+        v1 = model(t1, p1)
+        v2 = model(t2, p2)
+        if v1.dim() == 1:
+            v1 = v1.unsqueeze(0)
+        if v2.dim() == 1:
+            v2 = v2.unsqueeze(0)
+
+        n = v1.size(0)
         labels = labels[success_indices].to(device)
-        loss = _loss_fn(vec1, vec2, labels)
-        cos_sim = torch.nn.functional.cosine_similarity(vec1, vec2, dim=1)
+        loss = _loss_fn(v1, v2, labels)
+        cos_sim = torch.nn.functional.cosine_similarity(v1, v2, dim=1)
         pred_sim = (cos_sim > threshold).float()
         correct = (pred_sim == labels).float().sum().item()
         return loss, int(correct), n
@@ -249,6 +247,15 @@ def main() -> None:
     parser.add_argument("--embed-dim", type=int, default=64, help="嵌入维度")
     parser.add_argument("--output-dim", type=int, default=128, help="输出嵌入维度")
     parser.add_argument("--seed", type=int, default=145, help="随机种子")
+    parser.add_argument(
+        "--use-amp", action="store_true", help="启用混合精度训练 (AMP)，降低显存占用"
+    )
+    parser.add_argument(
+        "--accumulation-steps",
+        type=int,
+        default=1,
+        help="梯度累积步数（等效 batch_size = --batch-size * --accumulation-steps）",
+    )
     parser.add_argument("--use-disk-cache", action="store_true", help="启用特征磁盘缓存")
     parser.add_argument("--no-disk-cache", action="store_true", help="禁用特征磁盘缓存")
     # 目标校验
@@ -529,6 +536,8 @@ def main() -> None:
             save_path=save_path,
             step_fn=step_fn,
             tb_writer=tb_writer,
+            use_amp=args.use_amp,
+            accumulation_steps=max(1, int(args.accumulation_steps)),
         )
         show_progress = not args.no_progress_bar
         if show_progress:

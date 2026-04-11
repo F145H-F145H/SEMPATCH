@@ -1088,3 +1088,51 @@ PYTHONPATH=src .venv/bin/python -m pytest -m "not ghidra" -q
   - 优先准备/提供 `library_safe_embeddings.json`，或走 JSONL 侧车流程后再执行。
 - 交付标准：
   - 无论成功或部分完成，均查看 `output/<run>/pipeline_status.json` 作为事实来源。
+
+---
+
+## 2026-04-12：训练 OOM 全面修复
+
+### 背景
+
+RTX 3050 (4GB VRAM) 上训练频繁 OOM 崩溃。根因分析：
+
+1. **step_fn 逐样本前向**：每个 batch 内逐样本调用 `_tensorize_multimodal` + `model()`，B 个计算图全部保留至 `loss.backward()`，GPU 显存峰值极高
+2. **无混合精度 (AMP)**：全部 float32 运算
+3. **无梯度累积**：无法用小 batch 模拟大 batch
+4. **检索验证全库上 GPU**：`validation_retrieval.py` 将全部库嵌入加载到 GPU
+5. **"流式" JSON 解析器假流式**：`_iter_json_object_records` 用 `fp.read()` 一次性读入整个文件
+6. **检索状态跨 epoch 泄漏**：`_retrieval_state` 持有 library/query JSON 不释放
+
+### 修复内容
+
+| 文件 | 修改 |
+|------|------|
+| `src/features/trainer.py` | 新增 `use_amp` + `accumulation_steps` 参数；autocast 包裹 step_fn；GradScaler 支持；梯度累积逻辑 |
+| `scripts/sidechain/train_multimodal.py` | step_fn 改用 `tensorize_multimodal_many` 批量前向（保留逐样本 fallback）；新增 `--use-amp` `--accumulation-steps` CLI；检索验证后释放 `_retrieval_state` |
+| `scripts/sidechain/train_safe.py` | step_fn 改为 tokenize 全部样本后一次 stack 上 GPU + 单次批量前向；新增 `--use-amp` `--accumulation-steps` CLI |
+| `scripts/sidechain/build_embeddings_db.py` | `_iter_json_object_records` 改为真正的分块缓冲读取（1MB chunk + 前缀丢弃），内存 O(max_value) 而非 O(file_size) |
+| `src/features/validation_retrieval.py` | 库嵌入即时 `.cpu()` 移至 CPU；相似度计算分块上 GPU；默认 `embed_batch_size` 从 64 降至 16 |
+
+### 验证结果
+
+- **188 个现有测试通过**（2 个 pre-existing failure 与本次修改无关：`test_filter_index_by_pcode_len`、`test_mvp_binary_to_cve`）
+- **26 个训练相关测试全部通过**（safe_training、train_reproducibility、training_function_filter）
+- **合成数据 smoke test**：multimodal + SAFE 各 4 种配置（默认 / AMP+累积）均完成 2 epoch 训练
+- **black 格式化通过**；**isort 排序通过**；**ruff E/F/I 规则无新增问题**（仅 pre-existing E501 长行和 E402 导入顺序）
+
+### 使用方式
+
+```bash
+# RTX 3050 推荐配置
+PYTHONPATH=src python scripts/train_multimodal.py \
+  --precomputed-features data/binkit_functions.training.jsonl \
+  --use-amp --accumulation-steps 4 --batch-size 4 \
+  --max-seq-len 256 --max-graph-nodes 64 --max-dfg-nodes 64 \
+  --epochs 20 --num-pairs 5000
+
+PYTHONPATH=src python scripts/train_safe.py \
+  --vocab-from-features data/two_stage/library_features.jsonl \
+  --use-amp --accumulation-steps 4 --batch-size 8 \
+  --num-pairs 50000 --epochs 30
+```
