@@ -9,7 +9,20 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, BinaryIO, Dict, Iterable, Iterator, Optional, Set, Tuple
+from typing import Any, BinaryIO, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+
+
+# ── orjson 快速路径（可选，5-10x JSON 解析加速）──
+try:
+    import orjson as _orjson
+
+    def _json_loads(data: bytes) -> Any:
+        return _orjson.loads(data)
+
+    _HAS_ORJSON = True
+except ImportError:
+    _json_loads = json.loads  # type: ignore[assignment]
+    _HAS_ORJSON = False
 
 
 def _skip_json_string(line: bytes, i: int) -> Optional[int]:
@@ -148,18 +161,33 @@ def _parse_jsonl_record(obj: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
 
 
 def iter_jsonl_sidecar(path: str) -> Iterator[Tuple[str, Dict[str, Any]]]:
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                continue
-            rec = _parse_jsonl_record(obj)
-            if rec is not None:
-                yield rec
+    if _HAS_ORJSON:
+        # orjson 快速路径：直接读 bytes 解析（5-10x 快于标准库）
+        with open(path, "rb") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = _json_loads(line)
+                except Exception:
+                    continue
+                rec = _parse_jsonl_record(obj)
+                if rec is not None:
+                    yield rec
+    else:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except json.JSONDecodeError:
+                    continue
+                rec = _parse_jsonl_record(obj)
+                if rec is not None:
+                    yield rec
 
 
 def is_jsonl_sidecar_path(path: str) -> bool:
@@ -169,14 +197,14 @@ def is_jsonl_sidecar_path(path: str) -> bool:
     if p.endswith(".json"):
         return False
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, "rb") as f:
             for line in f:
-                s = line.strip()
-                if not s:
+                line = line.strip()
+                if not line:
                     continue
                 try:
-                    obj = json.loads(s)
-                except json.JSONDecodeError:
+                    obj = _json_loads(line)
+                except Exception:
                     return False
                 return _parse_jsonl_record(obj) is not None
     except OSError:
@@ -225,8 +253,8 @@ class JsonlSidecarLazyIndex:
     def _read_one(self, function_id: str, offset: int, length: int) -> Optional[Dict[str, Any]]:
         def _parse(raw: bytes) -> Optional[Dict[str, Any]]:
             try:
-                obj = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
+                obj = _json_loads(raw)
+            except Exception:
                 return None
             rec = _parse_jsonl_record(obj)
             if rec is None or rec[0] != function_id:
@@ -273,8 +301,8 @@ class JsonlSidecarLazyIndex:
                     raw = f.read(length)
                     pos_end = offset + length
                     try:
-                        obj = json.loads(raw.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        obj = _json_loads(raw)
+                    except Exception:
                         continue
                     rec = _parse_jsonl_record(obj)
                     if rec is None or rec[0] != fid:
@@ -312,8 +340,8 @@ class JsonlSidecarLazyIndex:
                     raw = f.read(length)
                     pos_end = offset + length
                     try:
-                        obj = json.loads(raw.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        obj = _json_loads(raw)
+                    except Exception:
                         continue
                     rec = _parse_jsonl_record(obj)
                     if rec is None or rec[0] != fid:
@@ -378,8 +406,8 @@ def build_jsonl_sidecar_lazy_index(
             fid = _extract_function_id_from_jsonl_line_bytes(line)
             if fid is None:
                 try:
-                    obj = json.loads(line.decode("utf-8"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                    obj = _json_loads(line.strip())
+                except Exception:
                     continue
                 rec = _parse_jsonl_record(obj)
                 if rec is None:
@@ -447,3 +475,79 @@ def load_precomputed_multimodal_map(
 def write_jsonl_sidecar_line(fp: Any, function_id: str, multimodal: Dict[str, Any]) -> None:
     rec = {"function_id": function_id, "multimodal": multimodal}
     fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def enrich_multimodal_with_ids(
+    multimodal: Dict[str, Any],
+    vocab: Dict[str, int],
+    unk_id: int = 1,
+) -> Dict[str, Any]:
+    """
+    在 multimodal 字典中注入预计算的整数 ID，供 tensorize 阶段快速读取。
+
+    修改的字段：
+    - sequence.pcode_token_ids  ← vocab.get(token, unk_id) 映射结果
+    - graph.node_features[*].opcode_id  ← vocab.get(opcode, unk_id)
+    - graph.num_nodes  ← len(node_features)
+
+    已有 pcode_token_ids / opcode_id 时跳过（幂等）。
+    返回新的 dict（浅拷贝顶层，深拷贝被修改的嵌套结构）。
+    """
+    import copy as _copy
+
+    mm = _copy.copy(multimodal)
+    seq = mm.get("sequence") or {}
+    graph = mm.get("graph") or {}
+
+    # ── sequence.pcode_token_ids ──
+    if "pcode_token_ids" not in seq:
+        tokens = seq.get("pcode_tokens") or []
+        if tokens:
+            seq = _copy.copy(seq)
+            seq["pcode_token_ids"] = [vocab.get(t, unk_id) for t in tokens]
+            mm["sequence"] = seq
+
+    # ── graph.node_features[*].opcode_id ──
+    node_feats = graph.get("node_features") or []
+    if node_feats and not all(
+        isinstance(nf, dict) and "opcode_id" in nf for nf in node_feats
+    ):
+        new_feats = []
+        for nf in node_feats:
+            if isinstance(nf, dict) and "opcode_id" in nf:
+                new_feats.append(nf)
+            elif isinstance(nf, dict):
+                nf = _copy.copy(nf)
+                opcodes = nf.get("pcode_opcodes") or []
+                nf["opcode_id"] = vocab.get(opcodes[0], unk_id) if opcodes else 0
+                new_feats.append(nf)
+            else:
+                # nf is a list (legacy format)
+                new_feats.append(nf)
+        graph = _copy.copy(graph)
+        graph["node_features"] = new_feats
+        graph["num_nodes"] = len(new_feats)
+        mm["graph"] = graph
+
+    return mm
+
+
+def enrich_records_with_ids(
+    records: List[Dict[str, Any]],
+    vocab: Dict[str, int],
+    unk_id: int = 1,
+) -> List[Dict[str, Any]]:
+    """
+    批量 enrichment：对训练记录列表中的每条 multimodal 注入预计算整数 ID。
+    records: [{"function_id": ..., "multimodal": {...}, ...}, ...]
+    """
+    enriched = []
+    for rec in records:
+        mm = rec.get("multimodal")
+        if isinstance(mm, dict):
+            new_rec = dict(rec)
+            new_rec["multimodal"] = enrich_multimodal_with_ids(mm, vocab, unk_id)
+            enriched.append(new_rec)
+        else:
+            enriched.append(rec)
+    return enriched

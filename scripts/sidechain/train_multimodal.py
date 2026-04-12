@@ -80,35 +80,38 @@ def _collate_pairs_tensorized(batch):
     """
     高效 collate_fn：在 DataLoader worker 进程中完成 tensorize（CPU）。
     返回已 batched 的 CPU tensor，step_fn 只需 .to(device) + model forward。
-    相比旧版（只做 list 拼装，tensorize 延迟到 step_fn），可将 GPU 等待时间降低 50%+。
+
+    优化：合并空值检测与特征收集为单次遍历（消除重复 dict 访问）。
     """
     from features.models.multimodal_fusion import tensorize_multimodal_many
 
-    f1_list = [b["feature1"] for b in batch]
-    f2_list = [b["feature2"] for b in batch]
-    labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
-
-    # 过滤空特征样本（采样失败的 placeholder）
-    empty_keys = {"graph", "sequence"}
+    labels_list = []
+    f1_valid = []
+    f2_valid = []
     valid_idx = []
-    for i, (f1, f2) in enumerate(zip(f1_list, f2_list)):
-        g1 = f1.get("graph", {})
-        g2 = f2.get("graph", {})
-        s1 = f1.get("sequence", {})
-        s2 = f2.get("sequence", {})
-        # 跳过完全空的 placeholder
-        if (not s1.get("pcode_tokens") and not g1.get("node_features") and
-                not s2.get("pcode_tokens") and not g2.get("node_features")):
-            continue
-        valid_idx.append(i)
 
-    if not valid_idx:
-        # 全部为空，返回空 batch
+    # 单次遍历：同时做空值检测 + 特征收集（消除旧版 2-3 次重复 dict 访问）
+    for i, item in enumerate(batch):
+        f1 = item["feature1"]
+        f2 = item["feature2"]
+        # 轻量有效性检查：只检查 sequence.pcode_tokens 或 graph.node_features 是否非空
+        s1 = f1.get("sequence")
+        g1 = f1.get("graph")
+        s2 = f2.get("sequence")
+        g2 = f2.get("graph")
+        has_f1 = (s1 and s1.get("pcode_tokens")) or (g1 and g1.get("node_features"))
+        has_f2 = (s2 and s2.get("pcode_tokens")) or (g2 and g2.get("node_features"))
+        if has_f1 or has_f2:
+            f1_valid.append(f1)
+            f2_valid.append(f2)
+            labels_list.append(item["label"])
+            valid_idx.append(i)
+
+    if not f1_valid:
+        labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
         return {"valid": False, "labels": labels}
 
-    f1_valid = [f1_list[i] for i in valid_idx]
-    f2_valid = [f2_list[i] for i in valid_idx]
-    labels_valid = labels[valid_idx]
+    labels_valid = torch.tensor(labels_list, dtype=torch.float32)
 
     t1 = tensorize_multimodal_many(
         f1_valid, _COLLATE_VOCAB, device=None,
@@ -708,6 +711,13 @@ def main():
             precomputed_lazy_log_first_n=max(0, int(args.precomputed_lazy_log_first_n)),
             fixed_pairs_per_epoch=use_fixed_pairs,
         )
+
+    # ── vocab enrichment：预计算 token IDs 到特征 dict，消除 tensorize 时的 vocab.get() 瓶颈 ──
+    if not args.synthetic and hasattr(dataset, 'enrich_with_vocab'):
+        try:
+            dataset.enrich_with_vocab(vocab)
+        except Exception as _e:
+            log.warning("vocab enrichment 失败（回退到运行时查表）: %s", _e)
 
     n = len(dataset)
     split = max(1, int(0.9 * n))

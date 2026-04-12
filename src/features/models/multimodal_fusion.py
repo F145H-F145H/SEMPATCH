@@ -271,9 +271,15 @@ def _tensorize_multimodal(
         raise RuntimeError("PyTorch required")
     seq = multimodal.get("sequence") or {}
     graph = multimodal.get("graph") or {}
-    tokens = seq.get("pcode_tokens") or []
     jump_mask = seq.get("jump_mask") or []
-    token_ids_raw = [vocab.get(t, 1) for t in tokens[:max_seq_len]]
+
+    # ── 序列 tokens：优先预计算 pcode_token_ids ──
+    precomp_ids = seq.get("pcode_token_ids")
+    if precomp_ids and isinstance(precomp_ids, list):
+        token_ids_raw = list(precomp_ids[:max_seq_len])
+    else:
+        tokens = seq.get("pcode_tokens") or []
+        token_ids_raw = [vocab.get(t, 1) for t in tokens[:max_seq_len]]
     token_ids = _clamp_ids(token_ids_raw, pcode_vocab_size)
     jump = list(jump_mask[:max_seq_len])
     if not token_ids:
@@ -287,10 +293,19 @@ def _tensorize_multimodal(
     pad_mask = torch.zeros(1, max_seq_len, dtype=torch.bool)
     if pad_len > 0:
         pad_mask[0, -pad_len:] = True
+
+    # ── Graph nodes：优先预计算 opcode_id ──
     node_feats = graph.get("node_features") or []
     nf_flat: List[int] = []
     for nf in node_feats[:max_graph_nodes]:
-        opcodes = nf if isinstance(nf, list) else nf.get("pcode_opcodes", []) or []
+        if isinstance(nf, dict):
+            precomp_op = nf.get("opcode_id")
+            if precomp_op is not None:
+                nf_flat.append(int(precomp_op))
+                continue
+            opcodes = nf.get("pcode_opcodes", []) or []
+        else:
+            opcodes = nf
         idx = vocab.get(opcodes[0], 1) if opcodes else 0
         nf_flat.append(idx)
     if not nf_flat:
@@ -370,7 +385,8 @@ def tensorize_multimodal_many(
     B = len(multimodals)
     _UNK = 1
 
-    # -- Pass 1: extract per-item token/node lists (pure Python, unavoidable for dict access) --
+    # -- Pass 1: extract per-item token/node lists --
+    # 优化：优先读预计算的 pcode_token_ids / opcode_id（避免 vocab.get() 循环）
     per_item_tokens: List[List[int]] = []
     per_item_jumps: List[List[int]] = []
     per_item_nodes: List[List[int]] = []
@@ -380,13 +396,25 @@ def tensorize_multimodal_many(
     per_item_dfg_edge_src: List[List[int]] = []
     per_item_dfg_edge_dst: List[List[int]] = []
 
+    _vocab_get = vocab.get
+    _empty_list: List[int] = []
+
     for mm in multimodals:
         seq = mm.get("sequence") or {}
         graph = mm.get("graph") or {}
-        tokens = seq.get("pcode_tokens") or []
         jump_mask = seq.get("jump_mask") or []
-        t_raw = [vocab.get(t, _UNK) for t in tokens[:max_seq_len]]
-        t_ids = _clamp_ids(t_raw, pcode_vocab_size)
+
+        # ── 序列 tokens：优先预计算 pcode_token_ids ──
+        precomp_ids = seq.get("pcode_token_ids")
+        if precomp_ids and isinstance(precomp_ids, list):
+            # 已有 int 列表，直接切片 + clamp（C 级速度，无 dict 查表）
+            t_raw = precomp_ids[:max_seq_len]
+            t_ids = [unk if v < 0 or v >= pcode_vocab_size else v for v in t_raw]
+        else:
+            tokens = seq.get("pcode_tokens") or []
+            t_raw = [_vocab_get(t, _UNK) for t in tokens[:max_seq_len]]
+            t_ids = _clamp_ids(t_raw, pcode_vocab_size)
+
         jmp = list(jump_mask[:max_seq_len])
         if not t_ids:
             t_ids = [_UNK]
@@ -394,13 +422,20 @@ def tensorize_multimodal_many(
         per_item_tokens.append(t_ids)
         per_item_jumps.append(jmp)
 
+        # ── Graph nodes：优先预计算 opcode_id ──
         node_feats = graph.get("node_features") or []
         nf: List[int] = []
         append_nf = nf.append
-        get_vocab = vocab.get
         for n_feat in node_feats[:max_graph_nodes]:
-            opcodes = n_feat if isinstance(n_feat, list) else n_feat.get("pcode_opcodes", []) or []
-            append_nf(get_vocab(opcodes[0], _UNK) if opcodes else 0)
+            if isinstance(n_feat, dict):
+                precomp_op = n_feat.get("opcode_id")
+                if precomp_op is not None:
+                    append_nf(int(precomp_op))
+                    continue
+                opcodes = n_feat.get("pcode_opcodes") or []
+            else:
+                opcodes = n_feat
+            append_nf(_vocab_get(opcodes[0], _UNK) if opcodes else 0)
         if not nf:
             nf = [0]
         nf = _clamp_ids(nf, pcode_vocab_size)
@@ -408,8 +443,8 @@ def tensorize_multimodal_many(
 
         ei = graph.get("edge_index") or [[], []]
         ei = _clamp_edge_index(ei, len(nf))
-        per_item_edge_src.append(ei[0] if ei and ei[0] else [])
-        per_item_edge_dst.append(ei[1] if ei and len(ei) > 1 and ei[1] else [])
+        per_item_edge_src.append(ei[0] if ei and ei[0] else _empty_list)
+        per_item_edge_dst.append(ei[1] if ei and len(ei) > 1 and ei[1] else _empty_list)
 
         dfg = mm.get("dfg") or {}
         dfg_nf = dfg.get("node_features") or []
@@ -420,8 +455,8 @@ def tensorize_multimodal_many(
 
         dei = dfg.get("edge_index") or [[], []]
         dei = _clamp_edge_index(dei, len(dfg_ids))
-        per_item_dfg_edge_src.append(dei[0] if dei and dei[0] else [])
-        per_item_dfg_edge_dst.append(dei[1] if dei and len(dei) > 1 and dei[1] else [])
+        per_item_dfg_edge_src.append(dei[0] if dei and dei[0] else _empty_list)
+        per_item_dfg_edge_dst.append(dei[1] if dei and len(dei) > 1 and dei[1] else _empty_list)
 
     # -- Pass 2: compute batch maxima --
     max_actual_seq = max(len(t) for t in per_item_tokens)

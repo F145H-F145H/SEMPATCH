@@ -6,7 +6,63 @@
 
 ---
 
-## 0 端到端流程总览
+## 0 快速开始（TL;DR）
+
+**已有 `.training.jsonl` 和 `binkit_functions.json`？直接从第 ⑦ ⑧ 步开始训练。**
+
+```bash
+# 前置：激活环境
+source .venv/bin/activate
+
+# （可选）安装 orjson 加速 JSON 解析 5-10x
+pip install orjson
+
+# ── 一键训练 SAFE 粗筛模型（~5-15 分钟，取决于数据量）──
+PYTHONPATH=src python scripts/sidechain/train_safe.py \
+  --index-file data/binkit_functions_common.json \
+  --precomputed-features data/binkit_functions_common.training.jsonl \
+  --vocab-from-features data/binkit_functions_common.training.jsonl \
+  --epochs 10 --batch-size 4 --num-pairs 10000 --lr 1e-3 \
+  --save-path output/safe_best_model.pt --no-tb
+
+# ── 一键训练 MultiModal 精排模型（~20-60 分钟）──
+PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
+  --index-file data/binkit_functions_common.json \
+  --precomputed-features data/binkit_functions_common.training.jsonl \
+  --vocab-from-features data/binkit_functions_common.training.jsonl \
+  --epochs 20 --batch-size 4 --num-pairs 20000 --lr 1e-4 \
+  --max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64 \
+  --num-workers 2 --pairing-mode binkit_refined \
+  --save-path output/best_model.pth --no-tb
+```
+
+### 训练加速自动生效（无需额外配置）
+
+训练脚本内置三项 CPU 优化，自动触发：
+
+| 优化 | 触发条件 | 效果 |
+|------|----------|------|
+| **Vocab 预计算** | `--vocab-from-features` + `--precomputed-features` 同时指定 | tensorize 4x 加速 |
+| **orjson 快速解析** | `pip install orjson` | JSONL 预载 6x 加速 |
+| **合并 collate** | 使用预计算特征时默认 | 消除重复 dict 访问 |
+
+### 从零开始的完整流程
+
+```
+① build_binkit_index          → binkit_functions.json
+② filter_index_by_pcode_len   → binkit_functions_filtered.json + .jsonl
+③ filter_index_by_common      → binkit_functions_common.json
+④ prepare_two_stage_data      → data/two_stage/
+⑤ build_library_features      → library_features.json
+⑥ (可选) build_embeddings_db  → .training.jsonl
+⑦ train_safe                  → safe_best_model.pt
+⑧ train_multimodal            → best_model.pth
+⑨ build_embeddings_db         → library_*_embeddings.json
+```
+
+---
+
+## 1 端到端流程总览
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -59,13 +115,13 @@
 
 ---
 
-## 1 数据流细节
+## 2 数据流细节
 
-### 1.1 Ghidra 提取 → lsir_raw
+### 2.1 Ghidra 提取 → lsir_raw
 
 每个二进制经 Ghidra 一次性导出全函数 `lsir_raw`，写入 `binary_cache`，后续步骤可直接读取缓存，避免重复 Ghidra 调用。
 
-### 1.2 lsir_raw → multimodal 特征
+### 2.2 lsir_raw → multimodal 特征
 
 ```
 lsir_raw
@@ -79,7 +135,7 @@ lsir_raw
    └─ fuse_features()              → {"multimodal": {graph, sequence, dfg}}
 ```
 
-### 1.3 `.training.jsonl` 侧车格式
+### 2.3 `.training.jsonl` 侧车格式
 
 每条记录：
 ```json
@@ -112,9 +168,25 @@ lsir_raw
 - **graph** `node_features`：**列表 of dict**（`{"pcode_opcodes": [...]}`），每个 dict 的第一个 opcode 经 `vocab.get()` 映射为整数 ID，喂入 `node_embed = nn.Embedding(pcode_vocab_size, embed_dim)`。
 - **dfg** `node_features`：**列表 of int**（0-511），是特征提取管道产生的原始整数，直接喂入 `dfg_node_embed = nn.Embedding(512, embed_dim)`，不做 vocab 映射。
 
+### 2.4 训练时的特征增强（Vocab Enrichment）
+
+训练脚本在 vocab 构建完成后、DataLoader 创建前，自动对已加载的特征注入预计算整数 ID：
+
+```
+原始 multimodal                     enrichment 后
+─────────────────                   ────────────────────────────
+sequence.pcode_tokens: ["COPY", ...]  + sequence.pcode_token_ids: [2, ...]
+graph.node_features[0]: {"pcode_opcodes":["BRANCH"]}
+                                      + graph.node_features[0]: {..., "opcode_id": 4}
+```
+
+Tensorize 优先读 `pcode_token_ids` / `opcode_id`（int list 切片，C 级速度），**消除每 batch ~24,000 次 `vocab.get()` 查表**。
+
+兼容性：无预计算 IDs 时自动回退到 `vocab.get()` 路径。旧 `.training.jsonl` 无需重新生成。
+
 ---
 
-## 2 阶段一：数据准备（详细步骤）
+## 3 阶段一：数据准备（详细步骤）
 
 ### 前置条件
 
@@ -233,7 +305,7 @@ PYTHONPATH=src python scripts/sidechain/build_embeddings_db.py \
 
 ---
 
-## 3 Vocab 构建
+## 4 Vocab 构建
 
 训练 MultiModal 和 SAFE 都需要一个 `vocab: Dict[str, int]`（`""`=0, `[UNK]`=1, 后续 token 递增）。
 
@@ -245,6 +317,8 @@ PYTHONPATH=src python scripts/sidechain/build_embeddings_db.py \
 ```
 
 内部调用 `collect_vocab_from_features_jsonl()`（`src/features/baselines/safe.py`），逐行扫描 `multimodal.sequence.pcode_tokens` 和 `multimodal.graph.node_features[*].pcode_opcodes`，不加载整个文件到内存。
+
+安装 `orjson` 后此步骤加速 5-10x（`pip install orjson`）。
 
 ### Vocab 大小与 Embedding 尺寸
 
@@ -265,33 +339,65 @@ vocab_size = max(len(vocab), 256)     # floor 256
 
 ---
 
-## 4 特征加载：侧车 → Dataset
+## 5 特征加载：侧车 → Dataset
 
 `PairwiseFunctionDataset`（`src/features/dataset.py`）是两个训练脚本共用的数据集。
 
-### 懒加载索引
+### 懒加载索引 + 预载
 
 构造时：
 1. 从 index 文件收集 `needed_ids = { "<binary>|<entry>", ... }`
 2. 对 `.training.jsonl` 调用 `build_jsonl_sidecar_lazy_index()`：**单遍二进制扫描**，只为 `needed_ids` 内的函数记录 `(byte_offset, line_length_bytes)`，不解析 multimodal 内容
-3. 运行时按 `function_id` 做 `f.seek(offset) → f.read(length) → json.loads` 单行解析
+3. 使用 `bulk_get_iter()` **按 offset 排序后单次顺序读 JSONL**，全部预载到内存（比逐条随机 seek 快 100x+）
+4. 训练时直接 `dict[key]` 查找，无磁盘 I/O
 
 ### 特征检索优先级（`_get_features`）
 
 ```
 1. 内存缓存（memory_cache, 按 hash 索引）
-2. 懒加载 JSONL（precomputed_lazy_index.get(fid) → seek + read + parse）
-3. 磁盘缓存（cache_dir/*.json）
-4. 动态提取（Ghidra，最后回退）
+2. 预计算特征（_precomputed_features dict, 内存中）
+3. 懒加载 JSONL（precomputed_lazy_index.get(fid) → seek + read + parse）
+4. 磁盘缓存（cache_dir/*.json）
+5. 动态提取（Ghidra，最后回退）
 ```
 
 使用 `.training.jsonl` 时，第 2 层直接命中，不会触发 Ghidra。
 
+### 训练时内部流程
+
+```
+┌─ DataLoader (num_workers=2, prefetch_factor=2) ──────────────────┐
+│                                                                   │
+│  Worker 0                    Worker 1                             │
+│  ┌──────────────────┐        ┌──────────────────┐                │
+│  │ __getitem__ ×4   │        │ __getitem__ ×4   │                │
+│  │  → _get_features │        │  → _get_features │                │
+│  │  → 正/负采样      │        │  → 正/负采样      │                │
+│  └────────┬─────────┘        └────────┬─────────┘                │
+│           │                           │                           │
+│           ▼                           ▼                           │
+│  ┌──────────────────┐        ┌──────────────────┐                │
+│  │ collate_fn       │        │ collate_fn       │                │
+│  │  → 空值检测       │        │  → 空值检测       │                │
+│  │  → tensorize     │        │  → tensorize     │  ← CPU 热路径  │
+│  │  → batched tensor│        │  → batched tensor│                │
+│  └────────┬─────────┘        └────────┬─────────┘                │
+│           └──────────┬───────────────┘                            │
+│                      ▼                                            │
+│           ┌──────────────────┐                                    │
+│           │  主进程           │                                    │
+│           │  .to(device)     │                                    │
+│           │  model.forward() │ ← GPU                              │
+│           │  loss.backward() │                                    │
+│           └──────────────────┘                                    │
+└───────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
-## 5 `_tensorize_multimodal`：特征 dict → Tensor
+## 6 `_tensorize_multimodal`：特征 dict → Tensor
 
-`src/features/models/multimodal_fusion.py:235`
+`src/features/models/multimodal_fusion.py`
 
 将 `multimodal` dict 转为 7 个 Tensor，喂入 `model.forward()`：
 
@@ -307,14 +413,23 @@ dfg_node_t (1, max_dfg_nodes) → dfg_node_features
 dfg_edge_t (2, num_edges)     → dfg_edge_index
 ```
 
-关键映射逻辑：
-- **sequence tokens**: `vocab.get(token, 1)` → 整数 ID → `token_t`（padding 用 0）
-- **graph nodes**: 取 `nf.get("pcode_opcodes", [])[0]` → `vocab.get(opcode, 1)` → `node_t`
-- **DFG nodes**: `int(x) % 512` → `dfg_node_t`（直接原始整数，模 512 保护）
+### 映射逻辑（含预计算快速路径）
+
+**sequence tokens**（优先级从高到低）：
+1. `sequence.pcode_token_ids`（int list）→ 直接切片 + clamp → `token_t` ⚡
+2. `sequence.pcode_tokens`（str list）→ `vocab.get(token, 1)` → clamp → `token_t`
+
+**graph nodes**（优先级从高到低）：
+1. `node_features[i].opcode_id`（int）→ 直接读取 → `node_t` ⚡
+2. `node_features[i].pcode_opcodes[0]`（str）→ `vocab.get(opcode, 1)` → `node_t`
+
+**DFG nodes**：`int(x) % 512` → `dfg_node_t`（直接原始整数，模 512 保护）
+
+标 ⚡ 的路径跳过 Python dict 查表循环，使用 int list 切片（C 级速度）。
 
 ---
 
-## 6 阶段二：训练
+## 7 阶段二：训练
 
 ### 前置条件
 
@@ -384,6 +499,8 @@ PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
 - `--use-dfg` / `--no-use-dfg`：是否启用 DFG 图分支（默认开）
 - `--init-weights`：从已有检查点热启（strict=False）
 - `--retrieval-val-dir`：每 epoch 末跑 Recall@1 检索验证
+- `--use-amp`：混合精度训练（默认开，降低显存占用）
+- `--accumulation-steps`：梯度累积（等效 batch_size × accumulation_steps）
 
 产出：`output/best_model.pth`（含 `{state_dict, meta}`）
 
@@ -397,9 +514,21 @@ PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
 - **固定采样对**（`--fixed-pairs-per-epoch`）：每个 epoch 预生成 `num_pairs` 对站点坐标，提升 JSONL 缓存命中率
 - **Epoch 间缓存清理**（默认开）：每个 epoch 后 `gc.collect()` + `torch.cuda.empty_cache()`
 
+### 训练日志
+
+```
+# 正常训练输出示例：
+PairwiseFunctionDataset: 预载 50000 个函数特征到内存（顺序读 JSONL）…
+PairwiseFunctionDataset: 预载完成 50000/50000 条，耗时 8.3s（6024 条/s）       ← orjson 加速
+PairwiseFunctionDataset: vocab enrichment 完成 50000 条，耗时 1.2s（41667 条/s）← 预计算 IDs
+使用 worker 端 tensorize collate_fn（预计算特征模式，高吞吐）
+[Trainer] 每 epoch: 训练 2250 batch | 验证 250 batch
+Epoch 1/20  train_loss=0.1842  val_loss=0.1523  val_acc=0.8734
+```
+
 ---
 
-## 7 阶段三：构建嵌入库
+## 8 阶段三：构建嵌入库
 
 训练完成后，用模型生成库嵌入供 `TwoStagePipeline` 匹配使用：
 
@@ -421,7 +550,36 @@ PYTHONPATH=src python scripts/sidechain/build_embeddings_db.py \
 
 ---
 
-## 8 OOM 应急
+## 9 性能调优指南
+
+### 9.1 CPU 瓶颈与加速
+
+训练循环中 GPU 常等 CPU 预处理（tensorize + 数据加载）。三项内置优化已自动生效：
+
+| 优化 | 文件 | 原理 | 加速 |
+|------|------|------|------|
+| Vocab 预计算 IDs | `dataset.enrich_with_vocab()` | tensorize 跳过 `vocab.get()` 循环，直接读 int list | 4x |
+| orjson 快速解析 | `precomputed_multimodal_io.py` | Rust 实现 JSON 解析替代纯 Python | 6x |
+| 合并 collate | `_collate_pairs_tensorized()` | 单次遍历消除重复 dict 访问 | 1.3x |
+
+### 9.2 GPU 瓶颈与加速
+
+| 手段 | 参数 | 效果 |
+|------|------|------|
+| 混合精度 | `--use-amp`（默认开） | 显存减半，训练加速 ~1.5x |
+| 梯度累积 | `--accumulation-steps 4` | 等效大 batch 不增显存 |
+| 减小序列长度 | `--max-seq-len 256` | 注意力矩阵 4x 缩小 |
+| torch.compile | 自动（PyTorch 2.0+） | 算子融合，~1.2x |
+
+### 9.3 数据加载调优
+
+| 参数 | 默认 | 调优建议 |
+|------|------|----------|
+| `--num-workers` | -1 (auto) | CPU 核心多时增大到 4-8 |
+| `--dataloader-prefetch-factor` | 2 | 增大到 4-8 让 CPU 提前跑 |
+| `--memory-cache-max-items` | 16384 | 大库增大到 32768+ |
+
+### 9.4 OOM 应急
 
 | 现象 | 处理 |
 |------|------|
@@ -432,7 +590,7 @@ PYTHONPATH=src python scripts/sidechain/build_embeddings_db.py \
 
 ---
 
-## 9 附录：关键代码路径速查
+## 10 附录：关键代码路径速查
 
 | 步骤 | 入口 | 文件 |
 |------|------|------|
@@ -441,17 +599,21 @@ PYTHONPATH=src python scripts/sidechain/build_embeddings_db.py \
 | 交叉过滤 | `filter_common_functions()` | `scripts/sidechain/filter_index_by_common_functions.py` |
 | 数据划分 | `prepare_two_stage_data.py` | `scripts/sidechain/prepare_two_stage_data.py` |
 | 库特征构建 | `build_library_features.py` | `scripts/sidechain/build_library_features.py` |
-| 侧车写出 | `_extract_training_features_from_raw()` | `scripts/sidechain/build_embeddings_db.py:71` |
-| 侧车读取（流式） | `iter_jsonl_sidecar()` | `src/utils/precomputed_multimodal_io.py:150` |
-| 侧车懒加载索引 | `build_jsonl_sidecar_lazy_index()` | `src/utils/precomputed_multimodal_io.py:346` |
-| Vocab 构建（JSONL） | `collect_vocab_from_features_jsonl()` | `src/features/baselines/safe.py:69` |
-| Dataset 特征加载 | `PairwiseFunctionDataset._get_features()` | `src/features/dataset.py:721` |
-| tensorize（单条） | `_tensorize_multimodal()` | `src/features/models/multimodal_fusion.py:235` |
-| tensorize（批量） | `tensorize_multimodal_many()` | `src/features/models/multimodal_fusion.py:320` |
-| MultiModal forward | `MultiModalFusionModel.forward()` | `src/features/models/multimodal_fusion.py:196` |
-| SAFE forward | `SafeEmbedder.embed_many()` | `src/features/baselines/safe.py:237` |
-| 嵌入推断（批量） | `embed_batch()` / `embed_batch_safe()` | `src/features/inference.py` / `src/features/baselines/safe.py` |
-| MultiModal 训练 | `scripts/train_multimodal.py` | `scripts/sidechain/train_multimodal.py` |
-| SAFE 训练 | `scripts/train_safe.py` | `scripts/sidechain/train_safe.py` |
+| 侧车写出 | `_extract_training_features_from_raw()` | `scripts/sidechain/build_embeddings_db.py` |
+| 侧车读取（流式） | `iter_jsonl_sidecar()` | `src/utils/precomputed_multimodal_io.py` |
+| orjson 快速解析 | `_json_loads()` | `src/utils/precomputed_multimodal_io.py` |
+| 侧车懒加载索引 | `build_jsonl_sidecar_lazy_index()` | `src/utils/precomputed_multimodal_io.py` |
+| Vocab enrichment | `enrich_multimodal_with_ids()` | `src/utils/precomputed_multimodal_io.py` |
+| Dataset enrichment | `PairwiseFunctionDataset.enrich_with_vocab()` | `src/features/dataset.py` |
+| Vocab 构建（JSONL） | `collect_vocab_from_features_jsonl()` | `src/features/baselines/safe.py` |
+| Dataset 特征加载 | `PairwiseFunctionDataset._get_features()` | `src/features/dataset.py` |
+| tensorize（单条） | `_tensorize_multimodal()` | `src/features/models/multimodal_fusion.py` |
+| tensorize（批量） | `tensorize_multimodal_many()` | `src/features/models/multimodal_fusion.py` |
+| collate（MultiModal） | `_collate_pairs_tensorized()` | `scripts/sidechain/train_multimodal.py` |
+| collate（SAFE） | `_collate_pairs_safe_tensorized()` | `scripts/sidechain/train_safe.py` |
+| MultiModal forward | `MultiModalFusionModel.forward()` | `src/features/models/multimodal_fusion.py` |
+| SAFE forward | `SafeEmbedder.embed_many()` | `src/features/baselines/safe.py` |
+| MultiModal 训练 | `train_multimodal.py` | `scripts/sidechain/train_multimodal.py` |
+| SAFE 训练 | `train_safe.py` | `scripts/sidechain/train_safe.py` |
 | 训练循环 | `Trainer.fit()` | `src/features/trainer.py` |
 | 嵌入库构建 | `build_embeddings_db.py` | `scripts/sidechain/build_embeddings_db.py` |

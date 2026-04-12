@@ -718,6 +718,34 @@ class PairwiseFunctionDataset(Dataset):
         if clear_lsir:
             self._lsir_raw_cache.clear()
 
+    def enrich_with_vocab(self, vocab: Dict[str, int], unk_id: int = 1) -> int:
+        """
+        用 vocab 对所有已加载的预计算特征注入 pcode_token_ids / opcode_id。
+        训练时 tensorize 优先读这些预计算 IDs，消除 vocab.get() 循环瓶颈。
+
+        应在 vocab 构建完成后、DataLoader 创建前调用。
+        返回成功 enrichment 的特征数量。
+        """
+        from utils.precomputed_multimodal_io import enrich_multimodal_with_ids
+
+        if not self._precomputed_features:
+            return 0
+        log = logging.getLogger(__name__)
+        n = 0
+        t0 = time.perf_counter()
+        for fid, mm in self._precomputed_features.items():
+            enriched = enrich_multimodal_with_ids(mm, vocab, unk_id)
+            self._precomputed_features[fid] = enriched
+            n += 1
+        dt = time.perf_counter() - t0
+        log.info(
+            "PairwiseFunctionDataset: vocab enrichment 完成 %d 条，耗时 %.1fs（%.0f 条/s）",
+            n, dt, n / dt if dt > 0 else 0,
+        )
+        # 同时清理 memory_cache（enriched 版本会通过 _get_features 自动缓存）
+        self._memory_cache.clear()
+        return n
+
     def _load_index(self, index_path: str) -> None:
         with open(index_path, encoding="utf-8") as f:
             raw = json.load(f)

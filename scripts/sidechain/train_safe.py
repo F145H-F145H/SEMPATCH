@@ -66,18 +66,20 @@ def _collate_pairs_safe_tensorized(batch):
     """
     高效 collate_fn：在 DataLoader worker 进程中完成 SAFE tokenize（CPU）。
     返回已 batched 的 CPU tensor，step_fn 只需 .to(device) + model forward。
+
+    优化：单次遍历完成有效性检查 + tokenize，消除重复 dict 访问。
     """
     from features.baselines.safe import safe_tokenize
 
-    f1_list = [b["feature1"] for b in batch]
-    f2_list = [b["feature2"] for b in batch]
-    labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
+    all_ids1, all_pad1, all_ids2, all_pad2, labels_list = [], [], [], [], []
 
-    all_ids1, all_pad1, all_ids2, all_pad2, valid_idx = [], [], [], [], []
-    for i, (f1, f2) in enumerate(zip(f1_list, f2_list)):
-        seq1 = f1.get("sequence", {})
-        seq2 = f2.get("sequence", {})
-        if not seq1.get("pcode_tokens") and not seq2.get("pcode_tokens"):
+    for item in batch:
+        f1 = item["feature1"]
+        f2 = item["feature2"]
+        # 轻量有效性检查
+        s1 = f1.get("sequence")
+        s2 = f2.get("sequence")
+        if not (s1 and s1.get("pcode_tokens")) and not (s2 and s2.get("pcode_tokens")):
             continue
         try:
             ids1, pad1 = safe_tokenize(f1, _SAFE_COLLATE_VOCAB, max_len=_SAFE_COLLATE_MAX_LEN)
@@ -86,11 +88,12 @@ def _collate_pairs_safe_tensorized(batch):
             all_pad1.append(pad1)
             all_ids2.append(ids2)
             all_pad2.append(pad2)
-            valid_idx.append(i)
+            labels_list.append(item["label"])
         except Exception:
             continue
 
-    if not valid_idx:
+    if not all_ids1:
+        labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
         return {"valid": False, "labels": labels}
 
     return {
@@ -99,7 +102,7 @@ def _collate_pairs_safe_tensorized(batch):
         "p1": torch.tensor(all_pad1, dtype=torch.bool),
         "t2": torch.tensor(all_ids2, dtype=torch.long),
         "p2": torch.tensor(all_pad2, dtype=torch.bool),
-        "labels": labels[valid_idx],
+        "labels": torch.tensor(labels_list, dtype=torch.float32),
     }
 
 
@@ -539,6 +542,13 @@ def main() -> None:
                 seed=seed,
                 precomputed_lazy_reuse_read_file_handle=(num_workers == 0),
             )
+
+        # ── vocab enrichment：预计算 token IDs 到特征 dict ──
+        if not args.synthetic and hasattr(dataset, 'enrich_with_vocab'):
+            try:
+                dataset.enrich_with_vocab(vocab)
+            except Exception as _e:
+                log.warning("vocab enrichment 失败（回退到运行时查表）: %s", _e)
 
         n = len(dataset)
         split = max(1, int(0.9 * n))
