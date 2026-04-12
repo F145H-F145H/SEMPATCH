@@ -80,18 +80,24 @@ def main():
     parser.add_argument("--save-path", default="output/best_model.pth")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--pairing-mode", default="binkit_refined")
-    parser.add_argument("--memory-cache-max-items", type=int, default=4096,
+    parser.add_argument("--memory-cache-max-items", type=int, default=8192,
                         help="特征缓存上限（LRU），控制内存占用")
+    parser.add_argument("--use-amp", action="store_true", default=True,
+                        help="启用混合精度训练（默认开启）；--no-use-amp 可关闭")
+    parser.add_argument("--no-use-amp", action="store_true",
+                        help="禁用混合精度训练")
     args = parser.parse_args()
 
     from experiment_meta import set_deterministic
     set_deterministic(args.seed)
 
+    use_amp = args.use_amp and not args.no_use_amp
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("fast_train")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("Device: %s", device)
+    use_pin_memory = device.type == "cuda"
+    log.info("Device: %s, AMP: %s, pin_memory: %s", device, use_amp, use_pin_memory)
 
     # 1. 构建 vocab
     try:
@@ -128,10 +134,12 @@ def main():
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         collate_fn=_collate_pairs, generator=g,
+        pin_memory=use_pin_memory,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         collate_fn=_collate_pairs,
+        pin_memory=use_pin_memory,
     )
 
     # 3. 模型
@@ -178,6 +186,7 @@ def main():
         device=device,
         save_path=args.save_path,
         step_fn=step_fn,
+        use_amp=use_amp,
     )
 
     for epoch in range(args.epochs):

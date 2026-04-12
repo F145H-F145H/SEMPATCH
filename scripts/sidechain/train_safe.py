@@ -248,7 +248,9 @@ def main() -> None:
     parser.add_argument("--output-dim", type=int, default=128, help="输出嵌入维度")
     parser.add_argument("--seed", type=int, default=145, help="随机种子")
     parser.add_argument(
-        "--use-amp", action="store_true", help="启用混合精度训练 (AMP)，降低显存占用"
+        "--use-amp", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="启用混合精度训练 (AMP)，降低显存占用并加速计算（默认开启）",
     )
     parser.add_argument(
         "--accumulation-steps",

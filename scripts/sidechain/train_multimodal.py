@@ -292,7 +292,7 @@ def main():
         "--max-seq-len",
         type=int,
         default=cfg.get("max_seq_len", 512),
-        help="单样本最大序列长度（越大越耗显存）",
+        help="单样本最大序列长度（越大越耗显存；绝大多数函数 pcode<512）",
     )
     parser.add_argument(
         "--max-graph-nodes",
@@ -356,7 +356,9 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=cfg.get("seed", 42), help="随机种子（可复现）")
     parser.add_argument(
-        "--use-amp", action="store_true", help="启用混合精度训练 (AMP)，降低显存占用"
+        "--use-amp", action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("use_amp", True)),
+        help="启用混合精度训练 (AMP)，降低显存占用并加速计算（默认开启）",
     )
     parser.add_argument(
         "--accumulation-steps",

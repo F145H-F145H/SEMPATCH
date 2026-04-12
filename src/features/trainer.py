@@ -119,6 +119,7 @@ class Trainer:
                 )
             t_epoch_loop = time.perf_counter()
             log_first_batch_detail = epoch == 0
+            oom_skipped = 0
             for batch_idx, batch in enumerate(iterator):
                 if batch_idx == 0 and log_first_batch_detail:
                     t_after_data = time.perf_counter()
@@ -128,13 +129,28 @@ class Trainer:
                         t_after_data - t_epoch_loop,
                     )
                 t_before_step = time.perf_counter()
-                with autocast_ctx:
-                    if self.step_fn is None:
-                        loss = self._default_step(batch, self.model, self.loss_fn)
-                        correct = 0
-                        count = 1
-                    else:
-                        loss, correct, count = self.step_fn(batch, self.model, self.loss_fn)
+                try:
+                    with autocast_ctx:
+                        if self.step_fn is None:
+                            loss = self._default_step(batch, self.model, self.loss_fn)
+                            correct = 0
+                            count = 1
+                        else:
+                            loss, correct, count = self.step_fn(batch, self.model, self.loss_fn)
+                except RuntimeError as exc:
+                    if "out of memory" in str(exc).lower() and training:
+                        oom_skipped += 1
+                        _log.warning(
+                            "Trainer: [train] batch %d CUDA OOM，跳过本 batch（累计跳过 %d 次）。"
+                            "建议减小 --batch-size 或 --max-seq-len。",
+                            batch_idx, oom_skipped,
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        import gc as _gc
+                        _gc.collect()
+                        continue
+                    raise
                 if batch_idx == 0 and log_first_batch_detail:
                     t_after_step = time.perf_counter()
                     _log.info(
@@ -162,6 +178,10 @@ class Trainer:
                     # Step at accumulation boundary or last batch
                     is_last_batch = (batch_idx + 1 == n_batches) if n_batches is not None else False
                     if (batch_idx + 1) % self.accumulation_steps == 0 or is_last_batch:
+                        if self.scaler is not None:
+                            self.scaler.unscale_(self.optimizer)
+                        # 梯度裁剪：防止梯度爆炸导致训练不稳定和 OOM
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         if self.scaler is not None:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
@@ -200,6 +220,13 @@ class Trainer:
         finally:
             if pbar is not None and hasattr(pbar, "close"):
                 pbar.close()
+
+        if oom_skipped > 0:
+            _log.warning(
+                "Trainer: [%s epoch %d] 累计跳过 %d 个 batch（CUDA OOM）。"
+                "若频繁出现请减小 --batch-size 或 --max-seq-len。",
+                phase, epoch, oom_skipped,
+            )
 
         avg_loss = total_loss / total_count if total_count else 0.0
         acc = total_correct / total_count if total_count else 0.0
