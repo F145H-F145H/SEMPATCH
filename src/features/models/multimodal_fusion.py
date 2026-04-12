@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
 
     TORCH_AVAILABLE = True
 except ImportError:
@@ -227,6 +228,7 @@ class MultiModalFusionModel(nn.Module if TORCH_AVAILABLE else object):
         attn_out = attn_out.squeeze(1)
         fused = torch.cat([graph_emb, attn_out], dim=-1)
         out = self.fusion_proj(fused)
+        out = F.normalize(out, dim=-1)
         if out.shape[0] == 1:
             return out.squeeze(0)
         return out

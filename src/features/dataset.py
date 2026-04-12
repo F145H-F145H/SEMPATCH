@@ -522,10 +522,10 @@ class PairwiseFunctionDataset(Dataset):
             return None
         a, b = self._rng.sample(self._all_sites, 2)
         tries = 0
-        while a[2] == b[2] and a[0] == b[0] and tries < 50:
+        while a[2] == b[2] and tries < 50:
             a, b = self._rng.sample(self._all_sites, 2)
             tries += 1
-        if a[2] == b[2] and a[0] == b[0]:
+        if a[2] == b[2]:
             return None
         return ((a[0], a[1]), (b[0], b[1]))
 
