@@ -84,7 +84,17 @@ def main():
     raw = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
     state_dict, meta = parse_multimodal_checkpoint(raw)
     use_dfg = meta.get("use_dfg", False) or infer_use_dfg_from_state_dict(state_dict)
-    model = MultiModalFusionModel(pcode_vocab_size=pcode_vocab_size, use_dfg=use_dfg)
+    # infer embed_dim / hidden_dim / output_dim from checkpoint so model arch matches saved weights
+    ckpt_embed_dim = state_dict["seq_embed.weight"].shape[1]
+    ckpt_hidden_dim = state_dict["transformer.layers.0.linear1.weight"].shape[0]
+    ckpt_output_dim = state_dict["seq_proj.weight"].shape[0]
+    model = MultiModalFusionModel(
+        pcode_vocab_size=pcode_vocab_size,
+        embed_dim=ckpt_embed_dim,
+        hidden_dim=ckpt_hidden_dim,
+        output_dim=ckpt_output_dim,
+        use_dfg=use_dfg,
+    )
     model.load_state_dict(state_dict, strict=False)
     model.eval()
 

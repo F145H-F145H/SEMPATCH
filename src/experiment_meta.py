@@ -35,9 +35,12 @@ def set_deterministic(seed: int) -> None:
         numpy.random.seed(seed)
     except ImportError:
         pass
-    torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+    # torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.use_deterministic_algorithms(False, warn_only=True)
 
 
 def _git_info() -> Dict[str, Any]:
