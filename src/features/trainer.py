@@ -228,6 +228,16 @@ class Trainer:
         """循环训练与验证，保存最佳权重。
         on_epoch_end: 可选回调 (epoch_idx, train_loss, val_loss, val_acc)，用于外部日志（如 W&B）。
         on_epoch_begin: 可选回调 (epoch_idx)，在每个 epoch 训练开始前调用（如刷新固定样本对）。
+
+        cleanup_every_epoch 行为变更（修复 epoch 间缓存清空导致训练变慢/异常）：
+          - 当数据集使用预计算特征（有 clear_runtime_cache 且带 _precomputed_lazy_index
+            或 _precomputed_features）时，**仅清 lsir_raw_cache**，保留 memory_cache。
+            原因：memory_cache 是 JSONL 随机读的缓存层，清空后每个 __getitem__ 都要
+            fseek+json.loads，比 dict 查找慢 100-1000x，导致后续 epoch 训练极慢且
+            可能因 I/O 瓶颈导致 DataLoader 超时。
+          - 仅当数据集做动态提取（无预计算特征）时，才清空全部缓存（含 memory_cache），
+            因为此时 lsir_raw 才是真正的内存大头。
+          - gc.collect() 和 cuda.empty_cache() 始终执行。
         """
         import os
 
@@ -260,7 +270,22 @@ class Trainer:
                     run_kw["log_batches_every"],
                 )
 
-        def _clear_dataset_runtime_cache(loader: Any) -> None:
+        def _dataset_uses_precomputed(loader: Any) -> bool:
+            """检测数据集是否使用预计算特征（JSONL / JSON map），决定清理策略。"""
+            ds = getattr(loader, "dataset", None)
+            visited = set()
+            while ds is not None and id(ds) not in visited:
+                visited.add(id(ds))
+                # 有 lazy index 或 precomputed map → 使用预计算特征
+                if getattr(ds, "_precomputed_lazy_index", None) is not None:
+                    return True
+                if getattr(ds, "_precomputed_features", None):
+                    return True
+                ds = getattr(ds, "dataset", None)
+            return False
+
+        def _selective_clear_runtime_cache(loader: Any, *, clear_memory: bool) -> None:
+            """按策略选择性清理运行期缓存。"""
             ds = getattr(loader, "dataset", None)
             visited = set()
             while ds is not None and id(ds) not in visited:
@@ -268,10 +293,29 @@ class Trainer:
                 clear_fn = getattr(ds, "clear_runtime_cache", None)
                 if callable(clear_fn):
                     try:
-                        clear_fn()
+                        clear_fn(clear_memory=clear_memory, clear_lsir=True)
+                    except TypeError:
+                        # 兼容旧版 clear_runtime_cache() 无参数签名
+                        try:
+                            clear_fn()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 ds = getattr(ds, "dataset", None)
+
+        train_uses_precomputed = _dataset_uses_precomputed(self.train_loader)
+        val_uses_precomputed = _dataset_uses_precomputed(self.val_loader)
+
+        if cleanup_every_epoch:
+            if train_uses_precomputed or val_uses_precomputed:
+                _log.info(
+                    "[Trainer] epoch cleanup: 保留 memory_cache（预计算特征），仅清理 lsir_raw + gc + cuda"
+                )
+            else:
+                _log.info(
+                    "[Trainer] epoch cleanup: 清理全部缓存（动态提取模式）+ gc + cuda"
+                )
 
         for epoch in range(num_epochs):
             run_kw["epoch"] = epoch
@@ -305,8 +349,14 @@ class Trainer:
             if cleanup_every_epoch:
                 import gc
 
-                _clear_dataset_runtime_cache(self.train_loader)
-                _clear_dataset_runtime_cache(self.val_loader)
+                # 预计算特征路径：仅清 lsir_raw_cache，保留 memory_cache（避免 JSONL 随机读瓶颈）
+                # 动态提取路径：清全部缓存（lsir_raw 才是大头）
+                _selective_clear_runtime_cache(
+                    self.train_loader, clear_memory=not train_uses_precomputed
+                )
+                _selective_clear_runtime_cache(
+                    self.val_loader, clear_memory=not val_uses_precomputed
+                )
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()

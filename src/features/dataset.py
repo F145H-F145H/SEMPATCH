@@ -202,6 +202,36 @@ class PairwiseFunctionDataset(Dataset):
                     needed_ids or set(),
                     reuse_read_file_handle=self._precomputed_lazy_reuse_read_file_handle,
                 )
+                # ── 关键修复：顺序预载全部特征到内存，避免训练时逐条随机 fseek ──
+                # bulk_get_iter 按 offset 排序后单次顺序读 JSONL，比逐条随机读快 100x+。
+                # 训练场景下 needed_ids 通常 < 50k，特征 dict 占内存 < 500MB，完全可以全载。
+                if needed_ids and self._precomputed_lazy_index is not None:
+                    lazy = self._precomputed_lazy_index
+                    idx_map = getattr(lazy, "_index", None)
+                    if isinstance(idx_map, dict) and idx_map:
+                        n_need = len(idx_map)
+                        log = logging.getLogger(__name__)
+                        log.info(
+                            "PairwiseFunctionDataset: 预载 %d 个函数特征到内存（顺序读 JSONL）…",
+                            n_need,
+                        )
+                        t0 = time.perf_counter()
+                        loaded = 0
+                        try:
+                            for fid, mm in lazy.bulk_get_iter(idx_map.keys()):
+                                if isinstance(mm, dict):
+                                    self._precomputed_features[fid] = mm
+                                    loaded += 1
+                        except Exception as ex:
+                            log.warning("预载中断（回退到懒加载）: %s", ex)
+                        dt = time.perf_counter() - t0
+                        log.info(
+                            "PairwiseFunctionDataset: 预载完成 %d/%d 条，耗时 %.1fs（%.0f 条/s）",
+                            loaded,
+                            n_need,
+                            dt,
+                            loaded / dt if dt > 0 else 0,
+                        )
             else:
                 self._precomputed_features = load_precomputed_multimodal_map(
                     precomputed_features_path,

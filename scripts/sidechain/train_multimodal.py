@@ -849,6 +849,13 @@ def main():
         use_amp=args.use_amp,
         accumulation_steps=max(1, int(args.accumulation_steps)),
     )
+    # 智能 epoch cleanup：预计算特征时自动跳过 memory_cache 清理
+    effective_cleanup = not args.no_epoch_cleanup
+    if effective_cleanup and args.precomputed_features and not args.synthetic:
+        log.info(
+            "epoch cleanup 已启用但检测到预计算特征：将仅清理 lsir_raw 缓存，保留 memory_cache "
+            "避免 JSONL 随机读瓶颈。如需完全清理请使用 --no-epoch-cleanup（不推荐与预计算联用）。"
+        )
     show_progress = not args.no_progress_bar
     if show_progress:
         log.info("训练中：每个 epoch 内会显示 train/val 进度（安装 tqdm 时为进度条）。")
