@@ -166,8 +166,10 @@ class Trainer:
                 total_correct += correct
                 total_count += count
                 if training:
-                    # Gradient accumulation: zero_grad at start of window
-                    if batch_idx == 0 or (batch_idx % self.accumulation_steps == 0):
+                    # ── Gradient accumulation（修复版）──
+                    # 修复前：在 accumulation 窗口首 batch 之前就 zero_grad，逻辑冗余。
+                    # 修复后：只在首次 batch 和每次 step 后 zero_grad，确保梯度正确累积。
+                    if batch_idx == 0:
                         self.optimizer.zero_grad()
                     # Scale loss by accumulation steps for correct gradient averaging
                     scaled_loss = loss / self.accumulation_steps

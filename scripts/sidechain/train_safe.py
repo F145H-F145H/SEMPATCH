@@ -57,8 +57,54 @@ def _setup_rotating_logging(
     root.addHandler(sh)
 
 
+# ── SAFE collate_fn：worker 端完成 tokenize（CPU 预处理），主进程只做 .to(device) ──
+_SAFE_COLLATE_VOCAB: dict = {}
+_SAFE_COLLATE_MAX_LEN = 512
+
+
+def _collate_pairs_safe_tensorized(batch):
+    """
+    高效 collate_fn：在 DataLoader worker 进程中完成 SAFE tokenize（CPU）。
+    返回已 batched 的 CPU tensor，step_fn 只需 .to(device) + model forward。
+    """
+    from features.baselines.safe import safe_tokenize
+
+    f1_list = [b["feature1"] for b in batch]
+    f2_list = [b["feature2"] for b in batch]
+    labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
+
+    all_ids1, all_pad1, all_ids2, all_pad2, valid_idx = [], [], [], [], []
+    for i, (f1, f2) in enumerate(zip(f1_list, f2_list)):
+        seq1 = f1.get("sequence", {})
+        seq2 = f2.get("sequence", {})
+        if not seq1.get("pcode_tokens") and not seq2.get("pcode_tokens"):
+            continue
+        try:
+            ids1, pad1 = safe_tokenize(f1, _SAFE_COLLATE_VOCAB, max_len=_SAFE_COLLATE_MAX_LEN)
+            ids2, pad2 = safe_tokenize(f2, _SAFE_COLLATE_VOCAB, max_len=_SAFE_COLLATE_MAX_LEN)
+            all_ids1.append(ids1)
+            all_pad1.append(pad1)
+            all_ids2.append(ids2)
+            all_pad2.append(pad2)
+            valid_idx.append(i)
+        except Exception:
+            continue
+
+    if not valid_idx:
+        return {"valid": False, "labels": labels}
+
+    return {
+        "valid": True,
+        "t1": torch.tensor(all_ids1, dtype=torch.long),
+        "p1": torch.tensor(all_pad1, dtype=torch.bool),
+        "t2": torch.tensor(all_ids2, dtype=torch.long),
+        "p2": torch.tensor(all_pad2, dtype=torch.bool),
+        "labels": labels[valid_idx],
+    }
+
+
 def _collate_pairs(batch):
-    """自定义 collate：保持 dict 列表，不 stacking。"""
+    """自定义 collate：保持 dict 列表，不 stacking（fallback）。"""
     return {
         "feature1": [b["feature1"] for b in batch],
         "feature2": [b["feature2"] for b in batch],
@@ -67,20 +113,44 @@ def _collate_pairs(batch):
 
 
 def _make_safe_step_fn(vocab, device, loss_fn, max_len=512, threshold=0.5):
-    """构建 SAFE 训练步进函数：safe_tokenize -> _SafeEncoder -> ContrastiveLoss。"""
+    """构建 SAFE 训练步进函数。
+    优先使用 collate_fn 预 tensorize 的 batch（fast path），回退到旧 dict 路径（slow path）。
+    """
 
     def step_fn(batch, model, _loss_fn):
         from features.baselines.safe import safe_tokenize
 
-        f1_list = batch["feature1"] if isinstance(batch["feature1"], list) else [batch["feature1"]]
-        f2_list = batch["feature2"] if isinstance(batch["feature2"], list) else [batch["feature2"]]
-        labels = batch["label"]
+        labels = batch.get("labels") if isinstance(batch, dict) else None
+        if labels is None:
+            labels = batch.get("label")
         if torch.is_tensor(labels):
             labels = labels.float().to(device)
         else:
             labels = torch.tensor(labels, dtype=torch.float32, device=device)
 
-        # Tokenize all samples on CPU, then batch-transfer to GPU
+        # ── Fast path: collate_fn 已完成 tokenize（worker 端 CPU 预处理）──
+        if isinstance(batch, dict) and batch.get("valid") and "t1" in batch:
+            t1 = batch["t1"].to(device, non_blocking=True)
+            p1 = batch["p1"].to(device, non_blocking=True)
+            t2 = batch["t2"].to(device, non_blocking=True)
+            p2 = batch["p2"].to(device, non_blocking=True)
+            v1 = model(t1, p1)
+            v2 = model(t2, p2)
+            if v1.dim() == 1:
+                v1 = v1.unsqueeze(0)
+            if v2.dim() == 1:
+                v2 = v2.unsqueeze(0)
+            n = v1.size(0)
+            loss = _loss_fn(v1, v2, labels[:n])
+            cos_sim = torch.nn.functional.cosine_similarity(v1, v2, dim=1)
+            pred_sim = (cos_sim > threshold).float()
+            correct = (pred_sim == labels[:n]).float().sum().item()
+            return loss, int(correct), n
+
+        # ── Slow path: 旧 dict 格式 fallback ──
+        f1_list = batch["feature1"] if isinstance(batch["feature1"], list) else [batch["feature1"]]
+        f2_list = batch["feature2"] if isinstance(batch["feature2"], list) else [batch["feature2"]]
+
         all_ids1, all_pad1, all_ids2, all_pad2, success_indices = [], [], [], [], []
         for idx, (f1, f2) in enumerate(zip(f1_list, f2_list)):
             try:
@@ -97,7 +167,6 @@ def _make_safe_step_fn(vocab, device, loss_fn, max_len=512, threshold=0.5):
         if not all_ids1:
             return torch.tensor(0.0, device=device, requires_grad=True), 0, 0
 
-        # Stack into batch tensors and move to GPU once
         t1 = torch.tensor(all_ids1, dtype=torch.long, device=device)
         p1 = torch.tensor(all_pad1, dtype=torch.bool, device=device)
         t2 = torch.tensor(all_ids2, dtype=torch.long, device=device)
@@ -231,7 +300,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=10, help="训练 epoch 数")
     parser.add_argument("--batch-size", type=int, default=16, help="batch size")
     parser.add_argument(
-        "--num-workers", type=int, default=0, help="DataLoader worker 数（默认 0，降低 OOM 风险）"
+        "--num-workers", type=int, default=-1, help="DataLoader worker 数（-1=自动 min(4, cpu_count//2)；0=禁用）"
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
     parser.add_argument("--save-path", default=None, help="模型保存路径")
@@ -410,7 +479,11 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_pin_memory = device.type == "cuda"
-    num_workers = max(0, int(args.num_workers))
+    # 默认 num_workers = -1（自动 min(4, cpu_count//2)），--num-workers 0 可显式禁用
+    if args.num_workers >= 0:
+        num_workers = max(0, int(args.num_workers))
+    else:
+        num_workers = max(0, min(4, (os.cpu_count() or 1) // 2))
     num_pairs = args.num_pairs
     epochs = args.epochs
 
@@ -435,6 +508,14 @@ def main() -> None:
             embed_dim=args.embed_dim,
             output_dim=args.output_dim,
         ).to(device)
+
+        # ── 可选 torch.compile()（PyTorch 2.0+ JIT 优化）──
+        try:
+            if hasattr(torch, "compile"):
+                model = torch.compile(model)
+                log.info("已启用 torch.compile() 优化")
+        except Exception as _e:
+            log.info("torch.compile() 不可用，跳过: %s", _e)
 
         if args.synthetic:
             from features.dataset import PairwiseSyntheticDataset
@@ -464,24 +545,41 @@ def main() -> None:
         train_ds = torch.utils.data.Subset(dataset, range(split))
         val_ds = torch.utils.data.Subset(dataset, range(split, n))
 
+        # ── collate_fn 选择：预计算特征时使用 worker 端 tokenize（高吞吐）──
+        use_tensorized_collate = bool(args.precomputed_features and not args.synthetic)
+        if use_tensorized_collate:
+            global _SAFE_COLLATE_MAX_LEN
+            _SAFE_COLLATE_VOCAB.update(vocab)
+            _SAFE_COLLATE_MAX_LEN = max(1, 512)
+            _active_collate = _collate_pairs_safe_tensorized
+            log.info("使用 worker 端 tensorize collate_fn（SAFE 预计算特征模式）")
+        else:
+            _active_collate = _collate_pairs
+
         g = torch.Generator()
         g.manual_seed(seed + retry)
+        _dl_kw = {}
+        if num_workers > 0:
+            _dl_kw["persistent_workers"] = True
+            _dl_kw["prefetch_factor"] = 2
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=num_workers,
-            collate_fn=_collate_pairs,
+            collate_fn=_active_collate,
             generator=g,
             pin_memory=use_pin_memory,
+            **_dl_kw,
         )
         val_loader = DataLoader(
             val_ds,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=_collate_pairs,
+            collate_fn=_active_collate,
             pin_memory=use_pin_memory,
+            **_dl_kw,
         )
 
         try:
