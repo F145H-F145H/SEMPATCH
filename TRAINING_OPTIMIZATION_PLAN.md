@@ -1,12 +1,13 @@
-# SemPatch 训练流水线优化方案（v2 — GPU 利用率专项）
+# SemPatch 训练流水线优化方案（v3 — 可用性 + GPU 利用率）
 
-> **核心发现**：GPU 利用率 <5%，根本原因是数据流水线的 Python 开销远超 GPU 计算时间。
-> RTX 3050 上一个 batch 的 forward+backward 仅 1-3ms，但 CPU 侧数据准备耗时 10-30ms。
-> 优化目标：将数据准备从 Python dict 操作转为预计算 NumPy 数组索引，消除 per-sample 循环。
+> **目标**：让训练模型从 "需要理解 6 个脚本的复杂编排" 变成 "一条命令搞定"。
+> 同时将 GPU 利用率从 <5% 提升到 60-90%。
 
-> ## ✅ 实施状态
-> **Phase 1 已完成**（2026-04-13）：所有核心代码已实现并通过语法检查。
-> 新增 3 个文件，修改 3 个文件，总计 ~400 行新代码。
+> ## 实施状态
+> - **Phase 1** ✅ 已完成（2026-04-13）：预计算 Tensor 数组 + 新 Dataset + Collate
+> - **Phase 2** ✅ 已完成（2026-04-13）：DataLoader 优化（prefetch、pair 整数索引、消除 sha256）
+> - **Phase 3** ✅ 已完成（2026-04-13）：OOM 防护（Ghidra 超时、显存检测、安全 wrapper）
+> - **Phase 4** 🚧 规划中：训练可用性提升（一键训练、YAML 配置、Makefile 集成、维度校验）
 
 ---
 
@@ -65,6 +66,16 @@ GPU 利用率 = 1.5ms / (1.5ms + 3.5ms) ≈ 30% (理想情况)
 
 **根本原因**: 数据以 Python dict 格式存储（`{sequence: {pcode_tokens: [...]}, graph: {node_features: [{pcode_opcodes: [...]}], edge_index: [[...],[...]]}}`），每 batch 都要遍历这些嵌套结构做 tensorize。
 
+### 1.3 可用性瓶颈
+
+| 问题 | 影响 |
+|------|------|
+| 数据准备需手动编排 6 个脚本 | 新用户无法上手 |
+| `--max-dfg-nodes` 默认值不一致（jsonl_to_npz=64, train=128） | 维度不匹配导致 silent failure |
+| `train_safe.py` 无 `--config` 支持 | 配置管理割裂 |
+| 无 Makefile 训练目标 | 命令行参数易出错 |
+| TRAINING_WORKFLOW.md 侧重推理而非训练 | 文档与代码脱节 |
+
 ---
 
 ## 二、优化策略
@@ -98,7 +109,7 @@ node_counts:   np.int16 [N]                     # 实际节点数
 ```python
 class PrecomputedTensorDataset(Dataset):
     """纯数组索引数据集，零 Python dict 操作。"""
-    
+
     def __init__(self, arrays_path: str, index_path: str, num_pairs: int, ...):
         # mmap 模式加载（不占 RAM）
         self._arrays = np.load(arrays_path, mmap_mode='r')
@@ -106,7 +117,7 @@ class PrecomputedTensorDataset(Dataset):
         self._fid_to_idx: Dict[str, int] = ...  # 从 index.json 构建
         # pair 采样数据结构
         self._name_to_idx_list: Dict[str, List[int]] = ...  # 同名函数索引列表
-    
+
     def __getitem__(self, idx: int) -> Tuple:
         a_idx, b_idx, label = self._epoch_pairs[idx]  # 纯 int 元组
         # 纯数组切片，无 dict 操作
@@ -137,11 +148,11 @@ def collate_precomputed(batch):
     # 一次 numpy stack，零 dict 遍历
     a_tokens = torch.from_numpy(np.stack([b[0] for b in batch]))  # (B, max_seq_len)
     a_jumps  = torch.from_numpy(np.stack([b[1] for b in batch]))
-    # ... 
+    # ...
     return (a_tokens, a_jumps, ...), (b_tokens, b_jumps, ...), labels
 ```
 
-**预期收益**: 
+**预期收益**:
 - `__getitem__`: 15-35μs → **0.1-0.5μs**（100x）
 - `collate_fn`: 2-3ms → **0.05-0.1ms**（30x）
 - GPU 利用率: <5% → **60-90%**
@@ -266,6 +277,121 @@ exec systemd-run --user --pty \
   "$@"
 ```
 
+### 策略 G（新增）：训练可用性提升
+
+#### G1. 统一 YAML 配置（SAFE + MultiModal）
+
+当前 `train_safe.py` 无 `--config` 支持，训练超参只能通过命令行传递。新增统一配置：
+
+```yaml
+# configs/train_default.yaml — 两个脚本共用
+model: multimodal           # multimodal | safe
+epochs: 20
+batch_size: 4
+lr: 0.0001
+num_pairs: 20000
+seed: 42
+
+# 架构
+embed_dim: 64
+hidden_dim: 128
+output_dim: 128
+num_gnn_layers: 2
+num_transformer_layers: 2
+
+# 数据维度（jsonl_to_npz 和训练必须一致）
+max_seq_len: 512
+max_graph_nodes: 128
+max_dfg_nodes: 64
+
+# 训练
+use_dfg: true
+use_amp: true
+accumulation_steps: 2
+num_workers: 2
+pairing_mode: binkit_refined
+
+# SAFE 专有
+target_coarse_recall: 0.50
+target_recall_at_1: 0.45
+max_retries: 3
+```
+
+```python
+# train_safe.py 增加 --config 支持（与 train_multimodal.py 一致）
+parser.add_argument("--config", help="YAML 配置文件（CLI 覆盖 YAML）")
+```
+
+#### G2. 维度一致性校验
+
+`jsonl_to_npz.py` 的 `--max-dfg-nodes` 默认 64，但 `train_multimodal.py` 默认 128 → silent mismatch。
+
+```python
+# PrecomputedTensorDataset.__init__() 增加校验:
+def _validate_dims(self, expected: dict):
+    """校验 NPZ 数组维度与模型期望一致。"""
+    for key, expected_len in expected.items():
+        actual = self._arrays[key].shape[1] if self._arrays[key].ndim > 1 else None
+        if actual is not None and actual != expected_len:
+            raise ValueError(
+                f"NPZ 维度不匹配: {key} 实际 {actual} ≠ 期望 {expected_len}。"
+                f"请确保 jsonl_to_npz 和训练脚本使用相同的 --max-* 参数。"
+            )
+```
+
+#### G3. Makefile 训练目标
+
+```makefile
+# 训练便捷目标
+train-safe-npz:
+	@test -f $(NPZ) || (echo "先运行 jsonl_to_npz.py 生成 $(NPZ)"; exit 1)
+	$(PY) scripts/sidechain/train_safe.py \
+		--npz $(NPZ) --fid-map $(FID_MAP) --vocab $(VOCAB) \
+		--index-file $(INDEX) \
+		--epochs 10 --batch-size 4 --num-pairs 10000 --lr 1e-3 \
+		--save-path output/safe_best_model.pt --no-tb
+
+train-mm-npz:
+	@test -f $(NPZ) || (echo "先运行 jsonl_to_npz.py 生成 $(NPZ)"; exit 1)
+	$(PY) scripts/sidechain/train_multimodal.py \
+		--npz $(NPZ) --fid-map $(FID_MAP) --vocab $(VOCAB) \
+		--index-file $(INDEX) \
+		--epochs 20 --batch-size 4 --num-pairs 20000 --lr 1e-4 \
+		--max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64 \
+		--pairing-mode binkit_refined \
+		--save-path output/best_model.pth --no-tb
+
+jsonl-to-npz:
+	@test -f $(JSONL) || (echo "缺少 $(JSONL)"; exit 1)
+	@test -f $(INDEX) || (echo "缺少 $(INDEX)"; exit 1)
+	PYTHONPATH=src $(PYTHON) scripts/sidechain/jsonl_to_npz.py \
+		--jsonl $(JSONL) --index $(INDEX) -o $(NPZ) \
+		--max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64
+
+train-all: jsonl-to-npz train-safe-npz train-mm-npz
+```
+
+#### G4. 一键数据准备脚本（`prepare_training_data.py`）
+
+合并 ①-⑥ 步为单脚本，从原始二进制 → 过滤索引 + JSONL 侧车 + NPZ：
+
+```bash
+PYTHONPATH=src python scripts/sidechain/prepare_training_data.py \
+  --input-dir data/binkit_subset \
+  --output-dir data/training \
+  --min-pcode-len 16 \
+  --max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64 \
+  --workers 6
+```
+
+内部调用：
+1. `build_binkit_index.py` → `binkit_functions.json`
+2. `filter_index_by_pcode_len.py` → `binkit_functions_filtered.json` + `.jsonl`
+3. `filter_index_by_common_functions.py` → `binkit_functions_common.json`
+4. `prepare_two_stage_data.py` → `two_stage/`
+5. `build_library_features.py` → `library_features.json`
+6. `jsonl_to_npz.py` → `features.npz` + `fid_map.json` + `vocab.json`
+
 ---
 
 ## 三、实施计划
@@ -281,38 +407,50 @@ exec systemd-run --user --pty \
 | JSONL→NPZ 转换器 | `scripts/sidechain/jsonl_to_npz.py` (179行) | ✅ |
 | 训练脚本 --npz 参数集成 | `train_multimodal.py`, `train_safe.py` | ✅ |
 
-### Phase 2: DataLoader 深度优化
+### Phase 2: DataLoader 深度优化 ✅ 已完成
 
-| 任务 | 文件 | 工作量 |
+| 任务 | 文件 | 状态 |
+|------|------|------|
+| 增大 prefetch_factor 默认值 | `train_*.py` | ✅ |
+| pair 预计算改为整数索引 | `dataset.py` | ✅ |
+| 消除 sha256 cache_key | `dataset.py` | ✅ |
+
+### Phase 3: OOM 防护 ✅ 已完成
+
+| 任务 | 文件 | 状态 |
+|------|------|------|
+| Ghidra 超时保护 | `utils/ghidra_runner.py` | ✅ |
+| 显存压力检测 | `src/features/trainer.py` | ✅ |
+| 安全运行 wrapper | `scripts/run_training_safe.sh` | ✅ |
+
+### Phase 4: 训练可用性提升 🚧 规划中
+
+| 任务 | 文件 | 优先级 |
 |------|------|--------|
-| 增大 prefetch_factor 默认值 | `train_*.py` | 0.5h |
-| pair 预计算改为整数索引 | `dataset.py` | 0.5 天 |
-| 消除 sha256 cache_key | `dataset.py` | 0.5h |
-
-### Phase 3: OOM 防护
-
-| 任务 | 文件 | 工作量 |
-|------|------|--------|
-| Ghidra 超时保护 | `utils/ghidra_runner.py` | 0.5 天 |
-| 显存压力检测 | `src/features/trainer.py` | 0.5h |
-| 安全运行 wrapper | `scripts/run_training_safe.sh` | 0.5h |
+| `train_safe.py` 增加 `--config` YAML 支持 | `scripts/sidechain/train_safe.py` | P0 |
+| 维度一致性校验（NPZ shape vs 模型期望） | `src/features/dataset.py` | P0 |
+| `prepare_training_data.py` 一键数据准备 | `scripts/sidechain/prepare_training_data.py`（新建） | P0 |
+| Makefile 训练目标 | `Makefile` | P1 |
+| 统一 `configs/train_default.yaml` | `configs/train_default.yaml`（新建） | P1 |
+| `jsonl_to_npz.py` 默认 `--max-dfg-nodes` 改为 128 | `scripts/sidechain/jsonl_to_npz.py` | P1 |
+| CHECKPOINT 格式统一（SAFE vs MultiModal） | `train_safe.py`, `trainer.py` | P2 |
 
 ---
 
 ## 四、预期收益
 
-| 指标 | 当前 | Phase 1 后 | Phase 1+2 |
-|------|------|-----------|-----------|
-| GPU 利用率 | <5% | 50-70% | 70-90% |
+| 指标 | 当前 | Phase 1+2+3 | Phase 4（可用性） |
+|------|------|------------|-----------------|
+| GPU 利用率 | <5% | 70-90% | 70-90% |
 | `__getitem__` 耗时 | 15-35μs | 0.1-0.5μs | 0.1-0.5μs |
 | `collate_fn` 耗时 | 2-3ms | 0.05-0.1ms | 0.05-0.1ms |
-| 单 batch CPU 耗时 | 3-5ms | 0.2-0.5ms | 0.1-0.3ms |
-| 单 batch GPU 耗时 | 1.5-2ms | 1.5-2ms | 1.5-2ms |
-| GPU 利用率公式 | 1.5/(1.5+3.5)=30% | 1.5/(1.5+0.3)=83% | 1.5/(1.5+0.15)=91% |
-| 数据准备命令 | 6+ | 1 | 1 |
-| OOM 风险 | 中 | 低 | 极低 |
+| 单 batch CPU 耗时 | 3-5ms | 0.1-0.3ms | 0.1-0.3ms |
+| 数据准备命令数 | 6+ | 1 (jsonl_to_npz) | 1 (prepare_training_data) |
+| OOM 风险 | 中 | 极低 | 极低 |
+| **新手上手时间** | **数小时（理解 6 个脚本）** | 同左 | **~15 分钟（一条命令）** |
+| 维度不匹配风险 | 高（无校验） | 高（无校验） | 低（自动校验） |
 
-### 为什么当前只有 <5% 而不是 30%
+### 为什么当前 GPU 利用率只有 <5%
 
 DataLoader prefetch_factor=2, num_workers=2 → 最多预取 4 个 batch。
 但 pair 采样可能失败重试（尤其是 binkit_refined 模式下 160 次循环），
@@ -329,36 +467,29 @@ DataLoader prefetch_factor=2, num_workers=2 → 最多预取 4 个 batch。
 
 ---
 
-## 五、使用指南（Phase 1 已实现）
+## 五、使用指南（Phase 1-3 已实现）
 
-### 第一步：转换数据（一次性，~2分钟/50k函数）
+### 快速路径：已有 JSONL → 训练
 
 ```bash
-# 已有 .training.jsonl + 索引？直接转换
+source .venv/bin/activate
+
+# 第一步：JSONL → NPZ（一次性，~2分钟/50k函数）
 PYTHONPATH=src python scripts/sidechain/jsonl_to_npz.py \
   --jsonl data/binkit_functions_common.training.jsonl \
   --index data/binkit_functions_common.json \
   -o data/training/features.npz
-```
 
-输出 3 个文件：
-- `data/training/features.npz` — 预计算 tensor 数组
-- `data/training/features.fid_map.json` — function_id → array_index
-- `data/training/features.vocab.json` — pcode vocab
-
-### 第二步：训练（使用 npz 模式）
-
-```bash
-# SAFE 训练
+# 第二步：训练 SAFE
 PYTHONPATH=src python scripts/sidechain/train_safe.py \
   --npz data/training/features.npz \
   --fid-map data/training/features.fid_map.json \
   --vocab data/training/features.vocab.json \
   --index-file data/binkit_functions_common.json \
   --epochs 10 --batch-size 4 --num-pairs 10000 --lr 1e-3 \
-  --save-path output/safe_best_model.pt --no-tb --skip-validation
+  --save-path output/safe_best_model.pt --no-tb
 
-# MultiModal 训练
+# 第三步：训练 MultiModal
 PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
   --npz data/training/features.npz \
   --fid-map data/training/features.fid_map.json \
@@ -366,10 +497,23 @@ PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
   --index-file data/binkit_functions_common.json \
   --epochs 20 --batch-size 4 --num-pairs 20000 --lr 1e-4 \
   --max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64 \
-  --num-workers 2 --pairing-mode binkit_refined \
+  --pairing-mode binkit_refined \
   --save-path output/best_model.pth --no-tb
 ```
 
 ### 向后兼容
 
 不指定 `--npz` 时，训练脚本行为与修改前完全一致（使用 JSONL dict 格式）。
+
+### 维度一致性要求
+
+`jsonl_to_npz.py` 和训练脚本的以下参数**必须一致**：
+
+| 参数 | jsonl_to_npz 默认 | train_multimodal 默认 | **注意** |
+|------|--------------------|-----------------------|----------|
+| `--max-seq-len` | 512 | 512 | ✅ 一致 |
+| `--max-graph-nodes` | 128 | 128 | ✅ 一致 |
+| `--max-dfg-nodes` | **64** | **128** | ⚠️ 不一致！需手动传相同值 |
+| `--max-edges` | 512 | — | 无对应训练参数，自动适配 |
+
+**建议**：始终显式传入这些参数，不依赖默认值。

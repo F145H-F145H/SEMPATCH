@@ -67,7 +67,7 @@ class Trainer:
         """显存压力前瞻检测：reserved > 90% 时主动释放缓存。"""
         if TORCH_AVAILABLE and torch.cuda.is_available():
             reserved = torch.cuda.memory_reserved()
-            total = torch.cuda.get_device_properties(0).total_mem
+            total = torch.cuda.get_device_properties(0).total_memory
             if total > 0 and reserved / total > 0.90:
                 torch.cuda.empty_cache()
                 import gc as _gc
