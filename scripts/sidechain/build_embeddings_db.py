@@ -741,7 +741,7 @@ def main() -> None:
     parser.add_argument(
         "--safe-batch-size",
         type=int,
-        default=1024,
+        default=1024*16,
         help="--features-file 模式下 SAFE 分块嵌入批大小",
     )
     parser.add_argument(

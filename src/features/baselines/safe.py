@@ -237,9 +237,19 @@ def safe_load_model(
     output_dim = data.get("output_dim", _OUTPUT_DIM)
     if state is None or vocab is None:
         raise ValueError(f"SAFE 模型缺少 state_dict 或 vocab: {path}")
+
+    # Remove '_orig_mod.' prefix from keys if present (from torch.compile or DDP)
+    new_state = {}
+    for key, value in state.items():
+        if key.startswith("_orig_mod."):
+            new_key = key[10:]  # remove '_orig_mod.' (10 characters)
+            new_state[new_key] = value
+        else:
+            new_state[key] = value
+
     vocab_size = max(len(vocab), 256)
     model = _SafeEncoder(vocab_size=vocab_size, embed_dim=embed_dim, output_dim=output_dim)
-    model.load_state_dict(state)
+    model.load_state_dict(new_state)
     model.eval()
     return model, vocab
 
