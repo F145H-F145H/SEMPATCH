@@ -244,10 +244,29 @@ PYTHONPATH=src python scripts/sidechain/build_embeddings_db.py \
   --emit-training-features \
   -o output/library_embeddings.json
 ```
-
+ 
 产出：`output/library_embeddings.training.jsonl`
 
 ### ⑦-⑧ 训练
+
+PYTHONPATH=src python scripts/sidechain/train_safe.py \
+  --npz data/training/features.npz \
+  --fid-map data/training/features.fid_map.json \
+  --index data/binkit_functions_common.json \
+  --vocab data/training/features.vocab.json \
+  --epochs 10 --batch-size 4 --num-pairs 10000 --lr 1e-3 \
+  --save-path output/safe_best_model.pt --no-tb
+
+PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
+  --npz data/training/features.npz \
+  --fid-map data/training/features.fid_map.json \
+  --index data/binkit_functions_common.json \
+  --vocab data/training/features.vocab.json \
+  --epochs 20 --batch-size 4 --num-pairs 20000 --lr 1e-4 \
+  --save-path output/best_model.pth --no-tb
+
+
+
 
 从步骤⑥（或步骤②的侧车）拿到 `.training.jsonl` 后，转到 [路径 A](#路径-ajsonl--npz--训练5-分钟上手) 执行训练。
 

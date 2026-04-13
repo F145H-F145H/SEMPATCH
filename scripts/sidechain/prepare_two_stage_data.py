@@ -3,7 +3,10 @@
 两阶段数据划分：将 BinKit 索引拆分为函数库与查询集。
 
 按二进制随机划分（80% 库 / 20% 查询），仅保留「正样本充足」的查询
-（在库中至少有 1 个同名函数）。若有效查询数 < min-queries，逐步提高查询侧比例。
+（在库中至少有 1 个同 project_id + 同名函数）。若有效查询数 < min-queries，逐步提高查询侧比例。
+
+正样本 = 同一源码不同编译变体的同名函数（project_id 相同 + 函数名相同）
+负样本 = 不同源码的不同名函数
 
 输出：
   - data/two_stage/library_index.json
@@ -18,10 +21,12 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
 
 def _log(msg: str) -> None:
@@ -48,96 +53,160 @@ def _norm_entry(entry: str) -> str:
     return "0x" + s
 
 
+# GCC/Clang IPA 优化后缀：isra/constprop/part/lto_priv/cold/clone 等
+# 可能叠加（如 .isra.0.constprop.1），用循环剥离
+_IPA_SUFFIX_PAT = re.compile(
+    r"\.(isra|constprop|part|lto_priv|cold|hot|clone|llvm\.\d+)(?:\.\d+)*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_fn_name(name: str) -> str:
+    """剥离 GCC/Clang IPA 优化后缀（可能叠加），使同源函数名可匹配。"""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    prev = None
+    while prev != name:
+        prev = name
+        name = _IPA_SUFFIX_PAT.sub("", name)
+    return name
+
+
 def _function_id(binary_path: str, entry: str) -> str:
     """Format: binary_path|entry_address (relative path)."""
     return f"{binary_path}|{_norm_entry(entry)}"
 
 
-def _build_library_function_names(
+def _build_library_project_name_pairs(
     library_items: list,
     *,
+    normalize: bool = True,
     progress_every: int = 0,
-    label: str = "扫描库侧函数名",
+    label: str = "扫描库侧 (project_id, name) 对",
 ) -> set:
-    """库侧出现过的函数名集合（试探划分比例时用，避免构建 name→站点大表）。"""
-    names: set = set()
-    n_bin = len(library_items)
-    t0 = time.perf_counter()
-    for bi, item in enumerate(library_items, start=1):
-        for fn in item.get("functions", []) or []:
-            name = fn.get("name", "")
-            if name:
-                names.add(name)
-        if progress_every > 0 and bi % progress_every == 0:
-            elapsed = time.perf_counter() - t0
-            _log(f"  [{label}] 二进制 {bi}/{n_bin} ({elapsed:.1f}s)")
-    return names
+    """库侧出现过的 (project_id, normalized_name) 对集合（试探划分比例时用）。"""
+    from utils.binkit_provenance import derive_project_id
 
-
-def _build_name_to_positive_function_ids(
-    library_items: list,
-    *,
-    progress_every: int = 0,
-    label: str = "构建 name→正样本 function_id",
-) -> dict:
-    """
-    每个函数名在库侧的全部 function_id（只构建一次）。
-    值为 tuple，便于多查询同名时共享引用且避免被下游误改。
-    """
-    name_to_ids: dict = {}
+    pairs: set = set()
     n_bin = len(library_items)
     t0 = time.perf_counter()
     for bi, item in enumerate(library_items, start=1):
         binary = item.get("binary", "")
+        if not binary:
+            continue
+        pid = derive_project_id(binary)
+        for fn in item.get("functions", []) or []:
+            name = fn.get("name", "")
+            if not name:
+                continue
+            if normalize:
+                name = _normalize_fn_name(name)
+            if not name:
+                continue
+            pairs.add((pid, name))
+        if progress_every > 0 and bi % progress_every == 0:
+            elapsed = time.perf_counter() - t0
+            _log(f"  [{label}] 二进制 {bi}/{n_bin} ({elapsed:.1f}s)")
+    return pairs
+
+
+def _build_project_name_to_positive_function_ids(
+    library_items: list,
+    *,
+    normalize: bool = True,
+    progress_every: int = 0,
+    label: str = "构建 (project,name)→正样本 function_id",
+) -> dict:
+    """
+    按 (project_id, normalized_name) 分组，每组在库侧的全部 function_id。
+    值为 tuple，便于多查询共享引用且避免被下游误改。
+    """
+    from utils.binkit_provenance import derive_project_id
+
+    key_to_ids: dict = {}
+    n_bin = len(library_items)
+    t0 = time.perf_counter()
+    for bi, item in enumerate(library_items, start=1):
+        binary = item.get("binary", "")
+        if not binary:
+            continue
+        pid = derive_project_id(binary)
         for fn in item.get("functions", []) or []:
             name = fn.get("name", "")
             entry = fn.get("entry", "")
             if not name or not entry:
                 continue
+            norm_name = _normalize_fn_name(name) if normalize else name
+            if not norm_name:
+                continue
             fid = _function_id(binary, entry)
-            name_to_ids.setdefault(name, []).append(fid)
+            key_to_ids.setdefault((pid, norm_name), []).append(fid)
         if progress_every > 0 and bi % progress_every == 0:
             elapsed = time.perf_counter() - t0
             _log(f"  [{label}] 二进制 {bi}/{n_bin} ({elapsed:.1f}s)")
-    # 冻结为 tuple，供 ground_truth 多查询复用同一份正样本列表
-    return {k: tuple(v) for k, v in name_to_ids.items()}
+    # 冻结为 tuple
+    return {k: tuple(v) for k, v in key_to_ids.items()}
 
 
 def _count_positive_sufficient_queries(
-    query_items: list, library_names: set
+    query_items: list,
+    library_pairs: set,
+    *,
+    normalize: bool = True,
 ) -> int:
-    """统计查询侧中「在库侧至少有一个同名函数」的函数个数。"""
+    """统计查询侧中「在库侧至少有一个同 project_id + 同名函数」的函数个数。"""
+    from utils.binkit_provenance import derive_project_id
+
     count = 0
     for item in query_items:
+        binary = item.get("binary", "")
+        if not binary:
+            continue
+        pid = derive_project_id(binary)
         for fn in item.get("functions", []) or []:
             name = fn.get("name", "")
-            if name and name in library_names:
+            if not name:
+                continue
+            norm_name = _normalize_fn_name(name) if normalize else name
+            if not norm_name:
+                continue
+            if (pid, norm_name) in library_pairs:
                 count += 1
     return count
 
 
 def _build_ground_truth(
     query_items: list,
-    name_to_positives: dict,
+    project_name_to_positives: dict,
     *,
+    normalize: bool = True,
     progress_every: int = 0,
     label: str = "ground_truth 查询侧",
 ) -> dict:
     """
     ground_truth: query_function_id -> [positive_function_id, ...]
-    同名查询共享同一份正样本 tuple（语义与原先逐条 list 构造一致，json 写出仍为数组）。
+    按 (project_id, normalized_name) 匹配正样本。
     """
+    from utils.binkit_provenance import derive_project_id
+
     gt = {}
     n_bin = len(query_items)
     t0 = time.perf_counter()
     for bi, item in enumerate(query_items, start=1):
         binary = item.get("binary", "")
+        if not binary:
+            continue
+        pid = derive_project_id(binary)
         for fn in item.get("functions", []) or []:
             name = fn.get("name", "")
             entry = fn.get("entry", "")
             if not name or not entry:
                 continue
-            positives = name_to_positives.get(name)
+            norm_name = _normalize_fn_name(name) if normalize else name
+            if not norm_name:
+                continue
+            positives = project_name_to_positives.get((pid, norm_name))
             if not positives:
                 continue
             qid = _function_id(binary, entry)
@@ -177,6 +246,12 @@ def main() -> None:
         type=int,
         default=5,
         help="构建 name→sites 时每处理多少个二进制打印一行进度（0=关闭）",
+    )
+    parser.add_argument(
+        "--normalize-names",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="剥离 GCC/Clang IPA 优化后缀（.isra.0 等）后再匹配函数名（默认开）",
     )
     args = parser.parse_args()
 
@@ -227,13 +302,16 @@ def main() -> None:
         lib = shuffled[:n_lib]
         qry = shuffled[n_lib:]
         _log(f"  比例 {ratio:.0%}: 库 {n_lib} 个二进制 / 查询 {n_query} 个二进制，统计有效查询…")
-        lib_names = _build_library_function_names(
+        lib_pairs = _build_library_project_name_pairs(
             lib,
+            normalize=args.normalize_names,
             progress_every=pe,
-            label=f"库名集合 ratio={ratio:.2f}",
+            label=f"库对集合 ratio={ratio:.2f}",
         )
-        n_sufficient = _count_positive_sufficient_queries(qry, lib_names)
-        del lib_names
+        n_sufficient = _count_positive_sufficient_queries(
+            qry, lib_pairs, normalize=args.normalize_names,
+        )
+        del lib_pairs
         _log(f"       → 正样本充足查询数: {n_sufficient}")
         if n_sufficient >= args.min_queries:
             library_items = lib
@@ -253,19 +331,21 @@ def main() -> None:
                 )
             break
 
-    _log("[5/5] 生成 ground_truth（按函数名共享正样本列表）…")
-    name_to_positives = _build_name_to_positive_function_ids(
+    _log("[5/5] 生成 ground_truth（按 project_id + 函数名匹配正样本）…")
+    project_name_to_positives = _build_project_name_to_positive_function_ids(
         library_items,
+        normalize=args.normalize_names,
         progress_every=pe,
-        label="最终库侧 name→正样本",
+        label="最终库侧 (project,name)→正样本",
     )
     ground_truth = _build_ground_truth(
         query_items,
-        name_to_positives,
+        project_name_to_positives,
+        normalize=args.normalize_names,
         progress_every=pe,
         label="查询侧映射",
     )
-    del name_to_positives
+    del project_name_to_positives
     n_lib_bin = len(library_items)
     n_query_bin = len(query_items)
     n_lib_func = sum(len(x.get("functions", [])) for x in library_items)

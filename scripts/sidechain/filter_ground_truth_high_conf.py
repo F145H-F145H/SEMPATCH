@@ -64,7 +64,6 @@ def _fid_to_name_from_index(index_path: str, _project_root: str) -> dict:
 
 
 def main() -> None:
-    from utils.binkit_provenance import parse_binary_provenance
     from utils.training_function_filter import TrainingSymbolFilter, strip_linker_suffix
 
     p = argparse.ArgumentParser(description="过滤 ground_truth 为高置信子集")
@@ -124,8 +123,6 @@ def main() -> None:
         if not isinstance(positives, list) or qid not in q_mm:
             dropped += 1
             continue
-        q_bin = qid.split("|", 1)[0]
-        q_pid, _ = parse_binary_provenance(q_bin)
         qn = fid_names.get(qid, "")
         if qn and sym_f.is_excluded(strip_linker_suffix(qn)):
             dropped += 1
@@ -135,10 +132,8 @@ def main() -> None:
         for pid in positives:
             if not isinstance(pid, str):
                 continue
-            p_bin = pid.split("|", 1)[0]
-            p_pid, _ = parse_binary_provenance(p_bin)
-            if p_pid != q_pid:
-                continue
+            # project_id 过滤已移除：prepare_two_stage_data.py 上游已保证
+            # (project_id, name) 匹配，ground_truth.json 不含跨 project 正样本。
             if pid not in lib_mm:
                 continue
             pn = _graph_nodes(lib_mm[pid])
