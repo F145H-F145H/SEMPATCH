@@ -80,29 +80,46 @@ def build_faiss_index_streaming(embeddings_path, embed_dim=None):
 # 加载精排模型（根据你的实际模型修改）
 # ----------------------------------------------------------------------
 def load_rerank_model(model_path, device='cpu'):
-    """加载 MultiModalFusionModel 精排模型"""
-    try:
-        from models.fusion import MultiModalFusionModel
-    except ImportError:
-        print("错误: 无法导入 models.fusion.MultiModalFusionModel，请检查路径", file=sys.stderr)
-        sys.exit(1)
-    
+    import torch
+    from features.models.multimodal_fusion import MultiModalFusionModel
+
     checkpoint = torch.load(model_path, map_location='cpu')
-    
-    if 'config' in checkpoint:
-        config = checkpoint['config']
-        model = MultiModalFusionModel(**config)
-    elif 'model_state_dict' in checkpoint:
-        model = MultiModalFusionModel(embed_dim=768, num_modalities=2)
-    else:
-        model = MultiModalFusionModel(embed_dim=768, num_modalities=2)
-    
-    state_dict = checkpoint.get('model_state_dict') or checkpoint.get('state_dict') or checkpoint
-    model.load_state_dict(state_dict)
+    state_dict = checkpoint['state_dict']
+    meta = checkpoint.get('meta', {})
+
+    # 去除 _orig_mod. 或 module. 前缀
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('_orig_mod.'):
+            k = k[10:]   # 移除 '_orig_mod.'
+        elif k.startswith('module.'):
+            k = k[7:]    # 移除 'module.'
+        new_state_dict[k] = v
+
+    # 从 meta 提取配置
+    use_dfg = meta.get('use_dfg', False)
+    pcode_vocab_size = meta.get('pcode_vocab_size', 256)
+    max_seq_len = meta.get('max_seq_len', 512)
+    max_graph_nodes = meta.get('max_graph_nodes', 128)
+
+    model = MultiModalFusionModel(
+        pcode_vocab_size=pcode_vocab_size,
+        embed_dim=64,
+        hidden_dim=128,
+        output_dim=128,
+        max_seq_len=max_seq_len,
+        max_graph_nodes=max_graph_nodes,
+        num_gnn_layers=2,
+        num_transformer_layers=2,
+        num_heads=4,
+        dropout=0.1,
+        use_dfg=use_dfg
+    )
+
+    model.load_state_dict(new_state_dict)
     model.to(device)
     model.eval()
     return model
-
 
 # ----------------------------------------------------------------------
 # 流式提取查询的 SAFE 嵌入（适配 {"query_id": {"safe_embedding": [...]}} 格式）
@@ -110,28 +127,71 @@ def load_rerank_model(model_path, device='cpu'):
 def get_query_embeddings_streaming(query_features_path, needed_ids):
     """
     流式读取 query_features.json，只返回 needed_ids 对应的 SAFE 嵌入。
-    假设格式：{"query_id": {"safe_embedding": [...], ...}}
-    返回 {query_id: np.array(embedding)}
+    支持两种格式：
+      1. 预计算格式：{"query_id": {"safe_embedding": [...]}}
+      2. 直接列表格式：{"query_id": [...]}
+    返回 {query_id: np.array(embedding)}，value 为 None 表示需要后续实时计算
     """
     result = {}
     with open(query_features_path, 'rb') as f:
         parser = ijson.kvitems(f, '')
         for qid, value in parser:
             if qid in needed_ids:
-                emb = value.get('safe_embedding')
-                if emb is None:
-                    if isinstance(value, list):
-                        emb = value
+                if isinstance(value, list):
+                    # 直接就是 embedding 数组
+                    result[qid] = np.array(value, dtype=np.float32)
+                elif isinstance(value, dict):
+                    emb = value.get('safe_embedding')
+                    if emb is not None:
+                        result[qid] = np.array(emb, dtype=np.float32)
                     else:
-                        print(f"警告: 查询 {qid} 缺少 safe_embedding 字段", file=sys.stderr)
-                        continue
-                result[qid] = np.array(emb, dtype=np.float32)
-                if len(result) == len(needed_ids):
-                    break
-    missing = needed_ids - result.keys()
-    if missing:
-        print(f"警告: 以下查询在 query_features.json 中缺失 safe_embedding: {missing}", file=sys.stderr)
+                        # 多模态特征格式，标记为 None 等待实时计算
+                        result[qid] = None
+                if len([v for v in result.values() if v is not None]) + len([v for v in result.values() if v is None]) >= len(needed_ids):
+                    # 所有 needed_ids 都已发现（不管有无 embedding），提前结束
+                    if set(result.keys()) >= needed_ids:
+                        break
     return result
+
+
+def _compute_missing_embeddings(result_dict, query_features_path, safe_model_path, device='cpu'):
+    """对缺失 safe_embedding 的查询，用 SafeEmbedder 实时计算嵌入。"""
+    from features.baselines.safe import SafeEmbedder
+
+    missing_ids = [qid for qid, emb in result_dict.items() if emb is None]
+    if not missing_ids:
+        return
+    print(f"正在为 {len(missing_ids)} 个缺失 safe_embedding 的查询实时计算嵌入（SafeEmbedder）...")
+
+    embedder = SafeEmbedder(model_path=safe_model_path, device=device, prefer_cuda=(device == 'cuda'))
+
+    # 如果 embedder 模型加载失败，退出
+    if embedder._model is None:
+        print(f"错误: SafeEmbedder 模型加载失败 ({safe_model_path})，无法计算嵌入", file=sys.stderr)
+        sys.exit(1)
+
+    with open(query_features_path, encoding='utf-8') as f:
+        all_features = json.load(f)
+
+    batch = []
+    batch_ids = []
+    BATCH_SIZE = 256
+    for qid in missing_ids:
+        mm = all_features.get(qid, {})
+        batch.append(mm)
+        batch_ids.append(qid)
+        if len(batch) >= BATCH_SIZE:
+            vecs = embedder.embed_many(batch, batch_size=BATCH_SIZE)
+            for q, v in zip(batch_ids, vecs):
+                result_dict[q] = np.array(v, dtype=np.float32)
+            batch, batch_ids = [], []
+    if batch:
+        vecs = embedder.embed_many(batch, batch_size=BATCH_SIZE)
+        for q, v in zip(batch_ids, vecs):
+            result_dict[q] = np.array(v, dtype=np.float32)
+
+    computed = sum(1 for v in result_dict.values() if v is not None)
+    print(f"嵌入计算完成，共 {computed} 个查询拥有嵌入")
 
 
 # ----------------------------------------------------------------------
@@ -232,7 +292,7 @@ def main():
     parser.add_argument("--max-input-bytes", type=int, default=_DEFAULT_MAX_INPUT_BYTES)
     parser.add_argument("--coarse-k", type=int, default=100)
     parser.add_argument("--model-path", default=None)
-    parser.add_argument("--safe-model-path", default=None)  # 未使用，粗筛用 FAISS
+    parser.add_argument("--safe-model-path", default=None, help="SAFE 模型路径，用于实时计算缺失的查询嵌入")
     parser.add_argument("-k", nargs="+", type=int, default=[1, 5, 10])
     parser.add_argument("--output", default=None)
     parser.add_argument("--max-queries", type=int, default=None)
@@ -319,6 +379,19 @@ def main():
     # 5. 流式提取查询嵌入
     print("流式提取查询 SAFE 嵌入...")
     query_embeddings = get_query_embeddings_streaming(qf_path, needed_ids)
+
+    # 对缺失 safe_embedding 的查询实时计算
+    _missing = [qid for qid, emb in query_embeddings.items() if emb is None]
+    if _missing:
+        safe_model = args.safe_model_path or os.path.join(PROJECT_ROOT, "output", "best_model.pth")
+        if not os.path.isfile(safe_model):
+            print(f"错误: 需要 SAFE 模型实时计算嵌入，但模型文件不存在: {safe_model}", file=sys.stderr)
+            print("请使用 --safe-model-path 指定 SAFE 模型路径", file=sys.stderr)
+            sys.exit(1)
+        _compute_missing_embeddings(query_embeddings, qf_path, safe_model, device)
+
+    # 清除可能残留的 None 项
+    query_embeddings = {k: v for k, v in query_embeddings.items() if v is not None}
     print(f"成功提取 {len(query_embeddings)} 个查询嵌入")
 
     # 6. 逐查询评估
