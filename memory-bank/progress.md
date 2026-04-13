@@ -1136,3 +1136,66 @@ PYTHONPATH=src python scripts/train_safe.py \
   --use-amp --accumulation-steps 4 --batch-size 8 \
   --num-pairs 50000 --epochs 30
 ```
+
+---
+
+## Phase 2/3 补完：NPZ 训练流水线优化（2026-04-13）
+
+**完成时间**：2026-04-13
+
+### 背景
+
+TRAINING_OPTIMIZATION_PLAN.md 定义了三阶段优化方案。Phase 1（预计算 NPZ 全链路）已于同日完成并通过 patch 合入。本次补完 Phase 2/3 剩余条目。
+
+### 完成条目
+
+| 条目 | 文件 | 状态 |
+|------|------|------|
+| Plan 文档命名修正（edge_index → edge_src/edge_dst） | `TRAINING_OPTIMIZATION_PLAN.md` | ✅ |
+| train_safe.py epoch pair regeneration | `scripts/sidechain/train_safe.py` | ✅ 新增 `on_epoch_begin` 回调 + `_PairListDataset.update()` |
+| prefetch_factor 默认值 2 → 4 | `train_multimodal.py`, `train_safe.py` | ✅ |
+| GPU 显存压力前瞻检测 | `src/features/trainer.py` | ✅ 新增 `_maybe_drain_gpu()`，每 50 batch 调用 |
+| NPZ pipeline 单元测试 | `tests/test_npz_pipeline.py` (新, 17 tests) | ✅ 全部通过 |
+
+### 延后条目（非必需）
+
+| 条目 | 原因 |
+|------|------|
+| GhidraTimeout 专用异常类 | 现有 `communicate(timeout=)` 已足够 |
+| `run_training_safe.sh` wrapper | 运维层面优化，开发阶段非必需；OOM 防护已通过显存检测 + reactive catch 覆盖 |
+
+### 验证结果
+
+- `pytest tests/test_npz_pipeline.py -v`：**17 passed**
+- `pytest -m "not ghidra"`：**无回归**（现有测试不受影响）
+- 语法检查：`trainer.py`, `train_safe.py`, `train_multimodal.py` 均通过
+
+### 使用方式
+
+```bash
+# 数据转换（一次性）
+PYTHONPATH=src python scripts/sidechain/jsonl_to_npz.py \
+  --jsonl data/binkit_functions_common.training.jsonl \
+  --index data/binkit_functions_common.json \
+  -o data/training/features.npz
+
+# SAFE 训练（NPZ 模式，epoch 自动刷新 pairs）
+PYTHONPATH=src python scripts/sidechain/train_safe.py \
+  --npz data/training/features.npz \
+  --fid-map data/training/features.fid_map.json \
+  --vocab data/training/features.vocab.json \
+  --index-file data/binkit_functions_common.json \
+  --epochs 10 --batch-size 4 --num-pairs 10000 --lr 1e-3 \
+  --save-path output/safe_best_model.pt --no-tb --skip-validation
+
+# MultiModal 训练（NPZ 模式）
+PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
+  --npz data/training/features.npz \
+  --fid-map data/training/features.fid_map.json \
+  --vocab data/training/features.vocab.json \
+  --index-file data/binkit_functions_common.json \
+  --epochs 20 --batch-size 4 --num-pairs 20000 --lr 1e-4 \
+  --max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64 \
+  --num-workers 2 --pairing-mode binkit_refined \
+  --save-path output/best_model.pth --no-tb
+```

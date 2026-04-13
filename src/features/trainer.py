@@ -63,6 +63,16 @@ class Trainer:
         else:
             self.scaler = None
 
+    def _maybe_drain_gpu(self) -> None:
+        """显存压力前瞻检测：reserved > 90% 时主动释放缓存。"""
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            reserved = torch.cuda.memory_reserved()
+            total = torch.cuda.get_device_properties(0).total_mem
+            if total > 0 and reserved / total > 0.90:
+                torch.cuda.empty_cache()
+                import gc as _gc
+                _gc.collect()
+
     def _default_step(self, batch: Dict[str, Any], model: Any, loss_fn: Any) -> "torch.Tensor":
         """默认步进：需由外部注入 vocab 与 tensorize。此处为占位。"""
         raise NotImplementedError("Provide step_fn to Trainer")
@@ -121,6 +131,8 @@ class Trainer:
             log_first_batch_detail = epoch == 0
             oom_skipped = 0
             for batch_idx, batch in enumerate(iterator):
+                if batch_idx % 50 == 0 and batch_idx > 0:
+                    self._maybe_drain_gpu()
                 if batch_idx == 0 and log_first_batch_detail:
                     t_after_data = time.perf_counter()
                     _log.info(

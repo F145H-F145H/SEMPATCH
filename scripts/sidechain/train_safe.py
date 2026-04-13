@@ -406,6 +406,10 @@ def main() -> None:
         default=20,
         help="无 tqdm 时每隔多少个训练 batch 打印一行进度（需未加 --no-progress-bar）",
     )
+    # ── 预计算 npz 模式 ──
+    parser.add_argument("--npz", default=None, help="预计算 npz 特征文件路径")
+    parser.add_argument("--fid-map", default=None, help="function_id → array_index 映射 JSON")
+    parser.add_argument("--vocab", default=None, help="预计算 vocab JSON 路径（优先于 --vocab-from-features）")
     args = parser.parse_args()
 
     seed = args.seed
@@ -453,8 +457,12 @@ def main() -> None:
                 print(f"错误: 启用校验需存在 {name}: {p}", file=sys.stderr)
                 sys.exit(1)
 
-    # Vocab：优先从特征文件构建（JSONL 流式，避免大 library_features.json 整文件进内存）
-    if args.vocab_from_features and os.path.isfile(args.vocab_from_features):
+    # Vocab：优先从预计算文件加载，其次从 JSONL 流式扫描
+    if args.vocab and os.path.isfile(args.vocab):
+        log.info("正在从预计算文件加载词表: %s", args.vocab)
+        with open(args.vocab, encoding="utf-8") as f:
+            vocab = json.load(f)
+    elif args.vocab_from_features and os.path.isfile(args.vocab_from_features):
         from features.baselines.safe import (
             collect_vocab_from_features_file,
             collect_vocab_from_features_jsonl,
@@ -520,7 +528,48 @@ def main() -> None:
         except Exception as _e:
             log.info("torch.compile() 不可用，跳过: %s", _e)
 
-        if args.synthetic:
+        use_npz = bool(args.npz and args.fid_map and os.path.isfile(args.npz) and os.path.isfile(args.fid_map))
+
+        if use_npz:
+            # ── 预计算 npz 模式：零 dict 操作 ──
+            from features.dataset import PrecomputedTensorDataset
+            from features.precomputed_collate import collate_safe_precomputed
+
+            log.info("使用预计算 npz 模式: %s", args.npz)
+            dataset = PrecomputedTensorDataset(
+                npz_path=args.npz,
+                index_path=index_path,
+                fid_map_path=args.fid_map,
+                num_pairs=num_pairs,
+                seed=seed,
+                fixed_pairs_per_epoch=True,
+            )
+            # SAFE 只需要 token，构造简化 pair 数据
+            from features.precomputed_collate import make_safe_precomputed_pairs
+            log.info("预生成 SAFE pair 数据（%d 对）…", num_pairs)
+            pair_data = make_safe_precomputed_pairs(dataset, num_pairs, 0.5, seed)
+            # 直接用 list dataset（支持 epoch 刷新）
+            class _PairListDataset(torch.utils.data.Dataset):
+                def __init__(self, pairs):
+                    self._pairs = pairs
+                def __len__(self):
+                    return len(self._pairs)
+                def __getitem__(self, idx):
+                    return self._pairs[idx]
+                def update(self, new_pairs):
+                    self._pairs = new_pairs
+
+            pair_dataset = _PairListDataset(pair_data)
+            # 保存引用供 on_epoch_begin 回调使用
+            _npz_dataset = dataset
+            _npz_pair_dataset = pair_dataset
+            n = len(pair_dataset)
+            split = max(1, int(0.9 * n))
+            train_ds = torch.utils.data.Subset(pair_dataset, range(split))
+            val_ds = torch.utils.data.Subset(pair_dataset, range(split, n))
+            _active_collate = collate_safe_precomputed
+            log.info("使用预计算 SAFE collate_fn（零 dict 操作）")
+        elif args.synthetic:
             from features.dataset import PairwiseSyntheticDataset
 
             syn_path = args.synthetic_file or os.path.join(
@@ -544,34 +593,36 @@ def main() -> None:
             )
 
         # ── vocab enrichment：预计算 token IDs 到特征 dict ──
-        if not args.synthetic and hasattr(dataset, 'enrich_with_vocab'):
+        if not args.synthetic and not use_npz and hasattr(dataset, 'enrich_with_vocab'):
             try:
                 dataset.enrich_with_vocab(vocab)
             except Exception as _e:
                 log.warning("vocab enrichment 失败（回退到运行时查表）: %s", _e)
 
-        n = len(dataset)
-        split = max(1, int(0.9 * n))
-        train_ds = torch.utils.data.Subset(dataset, range(split))
-        val_ds = torch.utils.data.Subset(dataset, range(split, n))
+        if not use_npz:
+            # npz 模式已在上面设置 n/split/train_ds/val_ds/_active_collate
+            n = len(dataset)
+            split = max(1, int(0.9 * n))
+            train_ds = torch.utils.data.Subset(dataset, range(split))
+            val_ds = torch.utils.data.Subset(dataset, range(split, n))
 
-        # ── collate_fn 选择：预计算特征时使用 worker 端 tokenize（高吞吐）──
-        use_tensorized_collate = bool(args.precomputed_features and not args.synthetic)
-        if use_tensorized_collate:
-            global _SAFE_COLLATE_MAX_LEN
-            _SAFE_COLLATE_VOCAB.update(vocab)
-            _SAFE_COLLATE_MAX_LEN = max(1, 512)
-            _active_collate = _collate_pairs_safe_tensorized
-            log.info("使用 worker 端 tensorize collate_fn（SAFE 预计算特征模式）")
-        else:
-            _active_collate = _collate_pairs
+            # ── collate_fn 选择：预计算特征时使用 worker 端 tokenize（高吞吐）──
+            use_tensorized_collate = bool(args.precomputed_features and not args.synthetic)
+            if use_tensorized_collate:
+                global _SAFE_COLLATE_MAX_LEN
+                _SAFE_COLLATE_VOCAB.update(vocab)
+                _SAFE_COLLATE_MAX_LEN = max(1, 512)
+                _active_collate = _collate_pairs_safe_tensorized
+                log.info("使用 worker 端 tensorize collate_fn（SAFE 预计算特征模式）")
+            else:
+                _active_collate = _collate_pairs
 
         g = torch.Generator()
         g.manual_seed(seed + retry)
         _dl_kw = {}
         if num_workers > 0:
             _dl_kw["persistent_workers"] = True
-            _dl_kw["prefetch_factor"] = 2
+            _dl_kw["prefetch_factor"] = 4
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
@@ -652,8 +703,21 @@ def main() -> None:
         show_progress = not args.no_progress_bar
         if show_progress:
             log.info("训练中：每个 epoch 内会显示 train/val 进度（安装 tqdm 时为进度条）。")
+
+        # NPZ 模式：每个 epoch 刷新 pair 数据
+        if use_npz:
+            def _on_epoch_begin_safe(epoch: int) -> None:
+                _npz_dataset.regenerate_epoch_pairs()
+                new_pairs = make_safe_precomputed_pairs(
+                    _npz_dataset, num_pairs, 0.5, seed + epoch
+                )
+                _npz_pair_dataset.update(new_pairs)
+        else:
+            _on_epoch_begin_safe = None
+
         trainer.fit(
             epochs,
+            on_epoch_begin=_on_epoch_begin_safe,
             progress_bar=show_progress,
             log_batches_every=max(1, int(args.progress_log_every)),
         )

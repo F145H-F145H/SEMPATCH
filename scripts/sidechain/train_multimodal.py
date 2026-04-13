@@ -507,12 +507,28 @@ def main():
     parser.add_argument(
         "--dataloader-prefetch-factor",
         type=int,
-        default=2,
-        help="num_workers>0 时 DataLoader prefetch_factor（默认 2；仅 PyTorch DataLoader 支持）",
+        default=4,
+        help="num_workers>0 时 DataLoader prefetch_factor（默认 4；仅 PyTorch DataLoader 支持）",
+    )
+    # ── 预计算 npz 模式（零 dict 操作，GPU 利用率 60-90%）──
+    parser.add_argument(
+        "--npz",
+        default=None,
+        help="预计算 npz 特征文件路径（由 jsonl_to_npz.py 生成），启用后训练时零 dict 操作",
+    )
+    parser.add_argument(
+        "--fid-map",
+        default=None,
+        help="function_id → array_index 映射 JSON（与 --npz 配套）",
+    )
+    parser.add_argument(
+        "--vocab",
+        default=None,
+        help="预计算 vocab JSON 路径（与 --npz 配套，优先于 --vocab-from-features）",
     )
     args = parser.parse_args()
 
-    if not args.synthetic and not args.precomputed_features:
+    if not args.synthetic and not args.npz and not args.precomputed_features:
         try:
             from utils.ghidra_runner import GhidraEnvironmentError, require_ghidra_environment
 
@@ -591,7 +607,13 @@ def main():
     from features.models.multimodal_fusion import MultiModalFusionModel, get_default_vocab
     from features.trainer import Trainer
 
-    if args.vocab_from_features and os.path.isfile(args.vocab_from_features):
+    if args.vocab and os.path.isfile(args.vocab):
+        # npz 模式：直接加载预计算 vocab（无需扫描 JSONL）
+        log.info("正在从预计算文件加载词表: %s", args.vocab)
+        with open(args.vocab, encoding="utf-8") as f:
+            vocab = json.load(f)
+        vocab_src = "npz"
+    elif args.vocab_from_features and os.path.isfile(args.vocab_from_features):
         from features.baselines.safe import (
             collect_vocab_from_features_file,
             collect_vocab_from_features_jsonl,
@@ -671,7 +693,30 @@ def main():
         )
 
     use_fixed_pairs = False
-    if args.synthetic:
+    use_npz_mode = bool(args.npz and args.fid_map and os.path.isfile(args.npz) and os.path.isfile(args.fid_map))
+
+    if use_npz_mode:
+        # ── 预计算 npz 模式：零 dict 操作 ──
+        from features.dataset import PrecomputedTensorDataset
+        from features.precomputed_collate import collate_multimodal_precomputed
+
+        log.info("使用预计算 npz 模式: %s", args.npz)
+        dataset = PrecomputedTensorDataset(
+            npz_path=args.npz,
+            index_path=index_path,
+            fid_map_path=args.fid_map,
+            num_pairs=args.num_pairs,
+            seed=seed,
+            pairing_mode=str(args.pairing_mode),
+            max_cfg_node_ratio=float(args.max_cfg_node_ratio),
+            prefer_cross_variant_positive=bool(args.prefer_cross_variant),
+            graph_similar_max_delta=int(args.graph_similar_max_delta),
+            fixed_pairs_per_epoch=True,
+        )
+        _active_collate = collate_multimodal_precomputed
+        use_fixed_pairs = True
+        log.info("使用预计算 collate_fn（零 dict 操作，高 GPU 利用率）")
+    elif args.synthetic:
         from features.dataset import PairwiseSyntheticDataset
 
         syn_path = args.synthetic_file or os.path.join(PROJECT_ROOT, "data", "synthetic_pairs.json")
@@ -713,7 +758,7 @@ def main():
         )
 
     # ── vocab enrichment：预计算 token IDs 到特征 dict，消除 tensorize 时的 vocab.get() 瓶颈 ──
-    if not args.synthetic and hasattr(dataset, 'enrich_with_vocab'):
+    if not args.synthetic and not use_npz_mode and hasattr(dataset, 'enrich_with_vocab'):
         try:
             dataset.enrich_with_vocab(vocab)
         except Exception as _e:
@@ -725,8 +770,10 @@ def main():
     val_ds = torch.utils.data.Subset(dataset, range(split, n))
 
     # ── collate_fn 选择：预计算特征时使用 worker 端 tensorize（高吞吐）──
-    use_tensorized_collate = bool(args.precomputed_features and not args.synthetic)
-    if use_tensorized_collate:
+    if use_npz_mode:
+        # npz 模式已在上面设置 _active_collate = collate_multimodal_precomputed
+        log.info("使用预计算 npz collate_fn（零 dict 操作）")
+    elif bool(args.precomputed_features and not args.synthetic):
         # 配置全局 collate 参数（worker 进程通过 fork 继承）
         global _COLLATE_MAX_SEQ_LEN, _COLLATE_MAX_GRAPH_NODES, _COLLATE_MAX_DFG_NODES, _COLLATE_PCODE_VOCAB_SIZE
         _COLLATE_VOCAB.update(vocab)
