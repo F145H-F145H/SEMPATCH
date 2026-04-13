@@ -34,12 +34,7 @@ _DEFAULT_TEMP_DIR = os.path.join(PROJECT_ROOT, "output", "binkit_emb_temp")
 
 
 def _iter_json_object_records(fp):
-    """
-    流式解析 JSON 对象 {key: value, ...}，逐条 yield (key, value)。
-    使用分块读取，不将整个文件加载到内存（仅保留已解析前缀 + 1MB 缓冲）。
-    支持 value 为任意合法 JSON 类型（对象、数组、字符串、数字等）。
-    """
-    CHUNK = 1024 * 1024  # 1 MB
+    CHUNK = 1024 * 1024 * 1024
     buf = b""
     pos = 0
 
@@ -56,7 +51,6 @@ def _iter_json_object_records(fp):
             buf += chunk
 
     def _ensure(n):
-        """Ensure at least n bytes available from pos; return False if EOF."""
         if pos + n <= len(buf):
             return True
         _refill(pos + n)
@@ -64,19 +58,174 @@ def _iter_json_object_records(fp):
 
     def skip_string():
         nonlocal pos
-        pos += 1  # opening '"'
+        pos += 1
         while True:
-            if pos >= len(buf):
-                if not _ensure(1):
-                    return
+            if not _ensure(1):
+                return
             c = buf[pos]
             if c == 92:  # '\'
-                pos += 2  # skip escaped char
+                if not _ensure(2):
+                    return
+                pos += 2
                 continue
             if c == 34:  # '"'
                 pos += 1
                 return
             pos += 1
+
+    def skip_value():
+        nonlocal pos
+        while True:
+            if not _ensure(1):
+                return
+            c = buf[pos]
+            if c in b" \t\r\n":
+                pos += 1
+                continue
+            break
+        if c == 34:  # '"'
+            skip_string()
+            return
+        if c == 91:  # '['
+            pos += 1
+            depth = 1
+            while depth > 0:
+                if not _ensure(1):
+                    return
+                ch = buf[pos]
+                if ch == 34:
+                    skip_string()
+                    continue
+                if ch == 91:
+                    depth += 1
+                elif ch == 93:
+                    depth -= 1
+                pos += 1
+            return
+        if c == 123:  # '{'
+            pos += 1
+            depth = 1
+            while depth > 0:
+                if not _ensure(1):
+                    return
+                ch = buf[pos]
+                if ch == 34:
+                    skip_string()
+                    continue
+                if ch == 123:
+                    depth += 1
+                elif ch == 125:
+                    depth -= 1
+                pos += 1
+            return
+        if c in b"-0123456789tfn":
+            while True:
+                if not _ensure(1):
+                    return
+                if buf[pos] in b",} \t\r\n":
+                    break
+                pos += 1
+            return
+        pos += 1
+
+    # 读开头 '{'
+    if not _ensure(1):
+        return
+    while pos < len(buf) and buf[pos] in b" \t\r\n":
+        pos += 1
+    if pos >= len(buf) or buf[pos] != 123:
+        return
+    pos += 1
+
+    while True:
+        # 跳过空白
+        while True:
+            if not _ensure(1):
+                return
+            if buf[pos] not in b" \t\r\n":
+                break
+            pos += 1
+        if buf[pos] == 125:  # '}'
+            break
+        if buf[pos] != 34:  # 不是键的开始，尝试恢复
+            log.warning("期望键开始的 '\"'，得到 %r，尝试恢复", chr(buf[pos]))
+            while True:
+                if not _ensure(1):
+                    return
+                if buf[pos] == 34 or buf[pos] == 125:
+                    break
+                pos += 1
+            if buf[pos] == 125:
+                break
+            continue
+
+        key_start = pos
+        skip_string()
+        key_end = pos
+        try:
+            key = json.loads(buf[key_start:key_end].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            log.warning("跳过损坏的键: %r", e)
+            while True:
+                if not _ensure(1):
+                    return
+                if buf[pos] == 34:  # 找到下一个 "
+                    break
+                pos += 1
+            continue
+
+        # 跳过 ':'
+        while True:
+            if not _ensure(1):
+                return
+            if buf[pos] not in b" \t\r\n":
+                break
+            pos += 1
+        if buf[pos] != 58:
+            break
+        pos += 1
+
+        # 解析 value
+        while True:
+            if not _ensure(1):
+                return
+            if buf[pos] not in b" \t\r\n":
+                break
+            pos += 1
+        val_start = pos
+        skip_value()
+        val_end = pos
+        try:
+            value = json.loads(buf[val_start:val_end].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            log.warning("跳过损坏的值，对应键 %s: %r", key, e)
+            while True:
+                if not _ensure(1):
+                    return
+                if buf[pos] in (44, 125):  # ',' 或 '}'
+                    if buf[pos] == 125:
+                        return
+                    pos += 1
+                    break
+                pos += 1
+            continue
+
+        yield key, value
+        del value
+
+        # 跳过逗号或结束
+        while True:
+            if not _ensure(1):
+                return
+            if buf[pos] not in b" \t\r\n":
+                break
+            pos += 1
+        if buf[pos] == 44:  # ','
+            pos += 1
+        elif buf[pos] == 125:  # '}'
+            break
+        else:
+            break
 
     def skip_value():
         nonlocal pos

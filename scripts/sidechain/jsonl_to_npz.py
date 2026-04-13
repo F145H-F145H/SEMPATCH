@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, Set
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
@@ -97,41 +97,36 @@ def main():
     args = parser.parse_args()
 
     from utils.precomputed_multimodal_io import iter_jsonl_sidecar
-    from utils.npz_features import build_precomputed_npz
-    from features.baselines.safe import collect_vocab_from_features_jsonl
+    from utils.npz_features import build_precomputed_npz_streaming
 
     # 1. 收集需要的 function_ids
     log.info("步骤 1/4: 收集索引中的 function_ids…")
     needed = _collect_needed_ids(args.index)
     log.info("  需要 %d 个函数", len(needed))
 
-    # 2. 从 JSONL 加载需要的 multimodal + 构建 vocab
-    log.info("步骤 2/4: 从 JSONL 加载 multimodal 特征…")
-    multimodals: List[Tuple[str, Dict[str, Any]]] = []
+    # 2. 第一遍扫描：仅收集 vocab（不保留数据，峰值内存极低）
+    log.info("步骤 2/4: 第一遍扫描 — 收集 vocab …")
     vocab: Dict[str, int] = {"[PAD]": 0, "[UNK]": 1}
     t0 = time.perf_counter()
-    loaded = 0
+    scanned = 0
     for fid, mm in iter_jsonl_sidecar(args.jsonl):
         if fid not in needed:
             continue
-        multimodals.append((fid, mm))
         _collect_vocab_from_mm(mm, vocab)
-        loaded += 1
-        if loaded % 10000 == 0:
+        scanned += 1
+        if scanned % 10000 == 0:
             elapsed = time.perf_counter() - t0
-            log.info("  已加载 %d/%d (%.0f 条/s)", loaded, len(needed), loaded / elapsed if elapsed > 0 else 0)
-
+            log.info("  已扫描 %d/%d (%.0f 条/s)", scanned, len(needed), scanned / elapsed if elapsed > 0 else 0)
     elapsed = time.perf_counter() - t0
-    log.info("  加载完成: %d 个函数, %d vocab tokens, %.1fs", loaded, len(vocab), elapsed)
+    log.info("  vocab 收集完成: %d 个函数, %d tokens, %.1fs", scanned, len(vocab), elapsed)
 
-    missing = needed - {fid for fid, _ in multimodals}
-    if missing:
-        log.warning("  %d 个函数在 JSONL 中未找到（将跳过）", len(missing))
-
-    # 3. 转换为 npz
-    log.info("步骤 3/4: 转换为预计算 npz 数组…")
-    fid_to_idx = build_precomputed_npz(
-        multimodals, vocab, args.output,
+    # 3. 流式转换为 npz（两遍扫描 + memmap）
+    log.info("步骤 3/4: 两遍扫描 + memmap 流式转换…")
+    fid_to_idx = build_precomputed_npz_streaming(
+        args.jsonl,
+        needed,
+        vocab,
+        args.output,
         max_seq_len=args.max_seq_len,
         max_graph_nodes=args.max_graph_nodes,
         max_dfg_nodes=args.max_dfg_nodes,
