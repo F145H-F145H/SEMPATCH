@@ -68,12 +68,13 @@ def can_skip_ghidra(binary_path: str, script_output_path: str) -> bool:
 
 
 def binary_cache_key(binary_path: str) -> str:
-    """根据二进制路径与 mtime/size 生成缓存键。"""
+    """根据二进制路径与 mtime/size 生成缓存键。使用 realpath 解析符号链接，确保同一文件的缓存键一致。"""
+    real_path = os.path.realpath(binary_path)
     try:
-        st = os.stat(binary_path)
-        raw = f"{os.path.abspath(binary_path)}|{st.st_mtime}|{st.st_size}"
+        st = os.stat(real_path)
+        raw = f"{os.path.abspath(real_path)}|{st.st_mtime}|{st.st_size}"
     except OSError:
-        raw = f"{os.path.abspath(binary_path)}|0|0"
+        raw = f"{os.path.abspath(real_path)}|0|0"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
@@ -214,7 +215,7 @@ def peek_binary_cache(binary_path: str) -> Optional[dict]:
     避免在批处理 2000+ 二进制时累积持有数 GB 的 lsir_raw dict 引用。
     调用方可通过 clear_peek_cache() 在循环中主动释放。
     """
-    abs_path = os.path.abspath(binary_path)
+    abs_path = os.path.abspath(os.path.realpath(binary_path))
     if abs_path in _PEEK_MISS:
         return None
     if abs_path in _PEEK_CACHE:
