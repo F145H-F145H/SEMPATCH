@@ -68,10 +68,6 @@ def build_faiss_index_streaming(embeddings_path, embed_dim=None):
                 embed_dim = len(vec)
                 index = faiss.IndexFlatIP(embed_dim)   # 内积索引（余弦相似度）
             emb = np.array(vec, dtype=np.float32).reshape(1, -1)
-            # L2 归一化
-            emb_norm = np.linalg.norm(emb)
-            if emb_norm > 0:
-                emb = emb / emb_norm
             index.add(emb)
             id_list.append(obj['function_id'])
     
@@ -84,9 +80,50 @@ def build_faiss_index_streaming(embeddings_path, embed_dim=None):
 # 加载精排模型（根据你的实际模型修改）
 # ----------------------------------------------------------------------
 def load_rerank_model(model_path, device='cpu'):
-    from matcher.rerank import RerankModel
-    return RerankModel(model_path=model_path, device=device, prefer_cuda=(device == 'cuda'))
+    import torch
+    from features.models.multimodal_fusion import MultiModalFusionModel
 
+    checkpoint = torch.load(model_path, map_location='cpu')
+    state_dict = checkpoint['state_dict']
+    meta = checkpoint.get('meta', {})
+
+    # 去除 _orig_mod. 或 module. 前缀
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('_orig_mod.'):
+            k = k[10:]   # 移除 '_orig_mod.'
+        elif k.startswith('module.'):
+            k = k[7:]    # 移除 'module.'
+        new_state_dict[k] = v
+
+    # 从 meta 提取配置
+    use_dfg = meta.get('use_dfg', False)
+    pcode_vocab_size = meta.get('pcode_vocab_size', 256)
+    max_seq_len = meta.get('max_seq_len', 512)
+    max_graph_nodes = meta.get('max_graph_nodes', 128)
+
+    model = MultiModalFusionModel(
+        pcode_vocab_size=pcode_vocab_size,
+        embed_dim=64,
+        hidden_dim=128,
+        output_dim=128,
+        max_seq_len=max_seq_len,
+        max_graph_nodes=max_graph_nodes,
+        num_gnn_layers=2,
+        num_transformer_layers=2,
+        num_heads=4,
+        dropout=0.1,
+        use_dfg=use_dfg
+    )
+
+    model.load_state_dict(new_state_dict)
+    model.to(device)
+    model.eval()
+    return model
+
+# ----------------------------------------------------------------------
+# 流式提取查询的 SAFE 嵌入（适配 {"query_id": {"safe_embedding": [...]}} 格式）
+# ----------------------------------------------------------------------
 def get_query_embeddings_streaming(query_features_path, needed_ids):
     """
     流式读取 query_features.json，只返回 needed_ids 对应的 SAFE 嵌入。
@@ -160,28 +197,28 @@ def _compute_missing_embeddings(result_dict, query_features_path, safe_model_pat
 # ----------------------------------------------------------------------
 # 精排：对候选函数重排序（占位实现，请根据实际模型替换）
 # ----------------------------------------------------------------------
-def rerank_candidates(query_embedding, candidate_ids, feature_loader, rerank_model, device='cpu', query_mm=None):
-    """对粗筛候选进行精排。"""
+def rerank_candidates(query_embedding, candidate_ids, feature_loader, rerank_model, device='cpu'):
+    """
+    对粗筛候选进行精排。
+    参数：
+        query_embedding: np.array, 查询的 SAFE 嵌入
+        candidate_ids: list of str, 候选函数 ID
+        feature_loader: SQLiteFeatureLoader 或 dict（兼容旧内存字典）
+        rerank_model: PyTorch 模型
+    返回：[(id, score), ...] 按分数降序排列
+    """
     if not candidate_ids:
         return []
-    if isinstance(feature_loader, dict):
-        cand_features = [(cid, feature_loader.get(cid, {})) for cid in candidate_ids]
-    else:
-        try:
-            cand_features = [(cid, feature_loader.get(cid)) for cid in candidate_ids]
-        except Exception:
-            cand_features = [(cid, {}) for cid in candidate_ids]
-    cand_features = [(cid, mm) for cid, mm in cand_features if mm and isinstance(mm, dict)]
-    if not cand_features:
-        return [(cid, 0.0) for cid in candidate_ids]
-    if not query_mm:
-        return [(cid, 0.0) for cid in candidate_ids]
-    try:
-        return rerank_model.score(query_mm, cand_features)
-    except Exception as e:
-        print(f'  [rerank error] {e}')
-        return [(cid, 0.0) for cid in candidate_ids]
+    
+    # TODO: 替换为实际模型推理代码
+    # 占位实现：返回原始顺序，分数均为 0.0
+    # 实际使用时，请根据 MultiModalFusionModel 的输入格式，从 feature_loader 获取特征并计算分数
+    return [(cid, 0.0) for cid in candidate_ids]
 
+
+# ----------------------------------------------------------------------
+# 辅助函数
+# ----------------------------------------------------------------------
 def _human_bytes(n: int) -> str:
     x = float(n)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -364,15 +401,6 @@ def main():
     tied_top_count = 0
     rerank_ran_count = 0
 
-    print('加载查询多模态特征...')
-    import ijson as _ijson
-    _query_mm_cache = {}
-    with open(qf_path, 'rb') as _f:
-        for _qid, _val in _ijson.kvitems(_f, ''):
-            if _qid in all_query_ids and isinstance(_val, dict):
-                _query_mm_cache[_qid] = _val
-    print(f'  已加载 {len(_query_mm_cache)} 个查询的多模态特征')
-
     for qid in tqdm(all_query_ids, desc="评估查询"):
         if qid not in query_embeddings:
             ranked_ids_per_query[qid] = []
@@ -383,10 +411,6 @@ def main():
         positives = set(ground_truth.get(qid, []))
 
         # 粗筛
-        # L2 归一化 query embedding
-        q_norm = np.linalg.norm(q_emb)
-        if q_norm > 0:
-            q_emb = q_emb / q_norm
         scores, indices = index.search(q_emb, args.coarse_k)
         coarse_ids = [lib_ids[idx] for idx in indices[0] if idx != -1]
         if positives and any(cid in positives for cid in coarse_ids):
@@ -398,7 +422,7 @@ def main():
             continue
 
         # 精排
-        reranked = rerank_candidates(q_emb[0], coarse_ids, feature_loader, rerank_model, device, query_mm=_query_mm_cache.get(qid, {}))
+        reranked = rerank_candidates(q_emb[0], coarse_ids, feature_loader, rerank_model, device)
         rerank_ran_count += 1
         if not reranked:
             ranked_ids_per_query[qid] = []

@@ -834,7 +834,7 @@ def main():
             _dl_kw.get("prefetch_factor", "n/a"),
         )
 
-    loss_fn = ContrastiveLoss(margin=0.5).to(device)
+    loss_fn = ContrastiveLoss(margin=0.3).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     step_fn = _make_step_fn(
         vocab,

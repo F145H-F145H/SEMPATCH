@@ -94,14 +94,16 @@ PYTHONPATH=src python scripts/sidechain/train_safe.py \
 
 ```bash
 PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
-  --npz data/training/features.npz \
-  --fid-map data/training/features.fid_map.json \
-  --vocab data/training/features.vocab.json \
+  --epochs 50 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --num-pairs 100000 \
+  --save-path output/best_model_v3_refined.pth \
   --index-file data/binkit_functions_common.json \
-  --epochs 20 --batch-size 4 --num-pairs 20000 --lr 1e-4 \
-  --max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64 \
   --pairing-mode binkit_refined \
-  --save-path output/best_model.pth --no-tb
+  --use-amp \
+  --seed 42
+
 ```
 
 产出：`output/best_model.pth`
