@@ -42,3 +42,6 @@ requirements_frozen.txt
 
 # Docker
 .docker-data/
+
+# Paper
+paper
