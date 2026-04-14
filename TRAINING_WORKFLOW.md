@@ -55,10 +55,12 @@ make reproduce
 
 ```bash
 PYTHONPATH=src python scripts/sidechain/jsonl_to_npz.py \
-  --jsonl data/binkit_functions_common.training.jsonl \
-  --index data/binkit_functions_common.json \
-  -o data/training/features.npz \
+  --jsonl data/training/library_only.training.jsonl \
+  --index data/two_stage/library_index.json \
+  -o data/training/features_library_only.npz \
   --max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64
+
+ls -la data/training/features_library_only*
 ```
 
 产出 3 个文件：
@@ -77,12 +79,13 @@ data/training/
 
 ```bash
 PYTHONPATH=src python scripts/sidechain/train_safe.py \
-  --npz data/training/features.npz \
-  --fid-map data/training/features.fid_map.json \
-  --vocab data/training/features.vocab.json \
-  --index-file data/binkit_functions_common.json \
+  --npz data/training/features_library_only.npz \
+  --fid-map data/training/features_library_only.fid_map.json \
+  --vocab data/training/features_library_only.vocab.json \
+  --index-file data/two_stage/library_index.json \
   --epochs 10 --batch-size 4 --num-pairs 10000 --lr 1e-3 \
-  --save-path output/safe_best_model.pt --no-tb
+  --save-path output/safe_library_only.pt --no-tb --skip-validation
+
 ```
 
 训练后自动运行目标校验（coarse_recall / recall_at_1），未达标自动扩样重训。
@@ -94,15 +97,14 @@ PYTHONPATH=src python scripts/sidechain/train_safe.py \
 
 ```bash
 PYTHONPATH=src python scripts/sidechain/train_multimodal.py \
-  --epochs 50 \
-  --batch-size 8 \
-  --lr 3e-4 \
-  --num-pairs 100000 \
-  --save-path output/best_model_v3_refined.pth \
-  --index-file data/binkit_functions_common.json \
+  --npz data/training/features_library_only.npz \
+  --fid-map data/training/features_library_only.fid_map.json \
+  --vocab data/training/features_library_only.vocab.json \
+  --index-file data/two_stage/library_index.json \
+  --epochs 50 --batch-size 4 --num-pairs 100000 --lr 3e-4 \
+  --max-seq-len 512 --max-graph-nodes 128 --max-dfg-nodes 64 \
   --pairing-mode binkit_refined \
-  --use-amp \
-  --seed 42
+  --save-path output/best_model_library_only.pth --no-tb
 
 ```
 
@@ -122,6 +124,21 @@ PYTHONPATH=src python scripts/sidechain/build_embeddings_db.py \
   --features-file data/two_stage/library_features.json \
   --model sempatch --model-path output/best_model.pth \
   -o data/two_stage/library_mm_embeddings.json
+```
+
+### Step 5：评估
+
+```bash
+# Step 5: 用新模型评估（query binaries 完全未见过）
+PYTHONPATH=src python scripts/sidechain/eval_two_stage_fixed.py \
+  --allow-large-inputs \
+  --data-dir data/two_stage \
+  --model-path output/best_model_library_only.pth \
+  --safe-model-path output/safe_library_only.pt \
+  --library-features-db data/two_stage/library_features.db \
+  --coarse-k 100 \
+  -k 1 5 10 20 50 \
+  --output output/benchmarks/library_only_eval.json
 ```
 
 ---
@@ -240,11 +257,16 @@ PYTHONPATH=src python scripts/sidechain/build_library_features.py \
 如果步骤②的侧车已经包含所有需要的函数，可跳过此步。
 
 ```bash
+# Step 1: 构建 library-only 训练特征
 PYTHONPATH=src python scripts/sidechain/build_embeddings_db.py \
   --features-file data/two_stage/library_features.json \
-  --model-path output/safe_best_model.pt \
   --emit-training-features \
-  -o output/library_embeddings.json
+  --training-features-output data/training/library_only.training.jsonl \
+  --model-path output/safe_best_model.pt \
+  -o /dev/null
+
+wc -l data/training/library_only.training.jsonl
+
 ```
  
 产出：`output/library_embeddings.training.jsonl`
