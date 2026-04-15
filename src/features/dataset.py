@@ -1183,7 +1183,7 @@ class PrecomputedTensorDataset(Dataset):
 
     def _sample_negative_idx_refined(self) -> Optional[Tuple[int, int]]:
         # 硬负例：同 binary 不同 name
-        if self._multi_name_binaries and self._rng.random() < 0.85:
+        if self._multi_name_binaries and self._rng.random() < 0.67:
             for _ in range(10):
                 binary = self._rng.choice(self._multi_name_binaries)
                 entries = self._binary_to_names.get(binary, [])

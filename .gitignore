@@ -45,3 +45,4 @@ requirements_frozen.txt
 
 # Paper
 paper
+models/
